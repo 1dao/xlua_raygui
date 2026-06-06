@@ -7,43 +7,61 @@ else
     UNAME_S := $(shell uname -s)
     ifeq ($(UNAME_S),Linux)
         PLATFORM = LINUX
+    else ifeq ($(UNAME_S),Darwin)
+        PLATFORM = MACOS
     else
         PLATFORM = UNSUPPORTED
     endif
 endif
 
 # ============================================================================
-# 通用编译配置
+# 通用编译选项（编译期；链接方式/系统库放到各平台分支里）
 # ============================================================================
-CC = gcc
-CFLAGS = -shared -fPIC -O2 -DRAYGUI_IMPLEMENTATION
+CC       = gcc
+CFLAGS   = -fPIC -Os -ffunction-sections -fdata-sections -fvisibility=hidden -Wall -Wextra
 INCLUDES = -I../raylib/src -I../raygui/src
 
 # ============================================================================
 # 针对不同操作系统进行差异化配置
 # ============================================================================
 ifeq ($(PLATFORM),WINDOWS)
-    TARGET = raygui.dll
-    
-    # ✨【关键补充】：Windows 平台下运行环境的 Lua 动态库核心。
-    # 默认以标准 Lua 5.5 (lua54.dll) 为例。如果你使用的是 LuaJIT，请将其修改为 luajit-51.dll
+    TARGET  = raygui.dll
+    SHARED  = -shared
+    LDFLAGS = -Wl,--gc-sections,-s
+
+    # Windows 下运行环境的 Lua 动态库（标准 Lua 5.5 = lua55.dll；LuaJIT 改成 luajit-51.dll）
     LUA_LIB = lua55.dll
-    
-    # Windows 依赖项：静态链接 raylib，动态链接 Lua 核心，以及 Win32 原生图形/多媒体系统库
-    LIBS = ../raylib/src/libraylib.a $(LUA_LIB) -lgdi32 -luser32 -lm -lwinmm
+    # 静态链接 raylib + 动态链接 Lua + Win32 图形/多媒体系统库
+    LIBS    = ../raylib/src/libraylib.a $(LUA_LIB) -lgdi32 -luser32 -lm -lwinmm
 
 else ifeq ($(PLATFORM),LINUX)
-    TARGET = raygui.so
-    
-    # ✨【关键补充】：Linux 平台下系统自带或通过包管理器安装的 Lua 动态链接标志。
-    # 默认以 Linux 的 Lua 5.4 开发包为例 (-llua5.5)。如果是标准 Lua5.1/LuaJIT 可改为 -llua5.1 或 -llua
+    TARGET  = raygui.so
+    SHARED  = -shared
+    LDFLAGS = -Wl,--gc-sections,-s
+
+    # Lua 开发包链接标志（按发行版可能是 -llua5.4 / -llua / -lluajit-5.1）
     LUA_LIB_FLAG = -llua5.5
-    
-    # Linux 依赖项：除了 raylib 静态库和 Lua，Linux 还需要显式链接 OpenGL(GL)、X11窗口、线程及系统运行时
-    LIBS = ../raylib/src/libraylib.a $(LUA_LIB_FLAG) -lGL -lm -lpthread -ldl -lrt -lX11
+    # 静态链接 raylib 时，内置 GLFW 还会引用这些 X11 扩展库，
+    # 缺了会报 undefined reference（XRRGetScreenResources / XineramaQueryScreens 等）。
+    LIBS    = ../raylib/src/libraylib.a $(LUA_LIB_FLAG) \
+              -lGL -lm -lpthread -ldl -lrt \
+              -lX11 -lXrandr -lXinerama -lXi -lXcursor
+
+else ifeq ($(PLATFORM),MACOS)
+    CC      = clang
+    TARGET  = raygui.so
+    # macOS 的 Lua C 模块用 bundle：lua_* 符号在加载时由宿主(lua 可执行文件)解析，
+    # 因此无需在此链接 Lua 库。
+    SHARED  = -bundle -undefined dynamic_lookup
+    # Apple ld64 不认识 --gc-sections / -s，等价做法是 -dead_strip。
+    LDFLAGS = -Wl,-dead_strip
+
+    # raylib 在 macOS 依赖的系统框架（raygui 无音频，故不需要 CoreAudio/AudioToolbox）
+    LIBS    = ../raylib/src/libraylib.a \
+              -framework CoreVideo -framework IOKit -framework Cocoa -framework OpenGL
 
 else
-    $(error 抱歉，当前仅支持 Windows (MinGW) 和 Linux 编译环境！)
+    $(error 抱歉，当前仅支持 Windows (MinGW) / Linux / macOS 编译环境！)
 endif
 
 # ============================================================================
@@ -52,7 +70,7 @@ endif
 all: $(TARGET)
 
 $(TARGET): lua_raygui.c
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ lua_raygui.c $(LIBS)
+	$(CC) $(SHARED) $(CFLAGS) $(INCLUDES) -o $@ lua_raygui.c $(LIBS) $(LDFLAGS)
 
 # 清理编译产物
 clean:

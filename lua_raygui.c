@@ -5,6 +5,15 @@
 #define SUPPORT_GESTURES_SYSTEM   0
 #define SUPPORT_SCREEN_CAPTURE    0
 #define SUPPORT_GIF_RECORDING     0
+#define RAYGUI_SUPPORT_UTF8   // 核心！开启UTF-8支持（中文/Emoji必备）
+#define RAYGUI_IMPLEMENTATION
+
+// 跨平台导出宏（配合 -fvisibility=hidden 使用）
+#if defined(_WIN32)
+    #define EXPORT __declspec(dllexport)
+#else
+    #define EXPORT __attribute__((visibility("default")))
+#endif
 
 // ===================== 然后再包含头文件 =====================
 #include "../raylib/src/raylib.h"
@@ -20,10 +29,11 @@
 #define TEXT_BUF_SINGLE  4096
 #define TEXT_BUF_MULTI   16384
 #define FONT_PATH_MAX    1024
-#define FONT_CODEPOINT_MAX 8192
+#define FONT_CODEPOINT_MAX 131071
 #define FONT_UNICODE_MAX 0x110000
 #define FONT_CODEPOINT_BITS ((FONT_UNICODE_MAX + 7) / 8)
 #define FONT_TEXT_CACHE_SIZE 256
+#define MAX_TEXTURES 256
 
 typedef struct FontTextCacheEntry {
     uint64_t hash;
@@ -41,6 +51,9 @@ static int g_font_codepoint_count = 0;
 static unsigned char g_font_codepoint_bits[FONT_CODEPOINT_BITS] = {0};
 static FontTextCacheEntry g_font_text_cache[FONT_TEXT_CACHE_SIZE] = {0};
 static int g_font_text_cache_next = 0;
+
+static Texture g_textures[MAX_TEXTURES] = {0};
+static bool  g_texture_used[MAX_TEXTURES] = {0};
 
 static uint64_t font_hash_text(const char *text, size_t *length) {
     uint64_t hash = 1469598103934665603ULL;
@@ -190,6 +203,183 @@ static void font_reset(void) {
 }
 
 //============================================================================
+// 纹理管理
+//============================================================================
+// 找一个空槽存放纹理；满了返回 0（不抛错，由调用方负责释放传入的纹理）
+static int texture_alloc(Texture texture) {
+    for (int i = 1; i < MAX_TEXTURES; i++) {
+        if (!g_texture_used[i]) {
+            g_textures[i] = texture;
+            g_texture_used[i] = true;
+            return i;
+        }
+    }
+    return 0;
+}
+
+static void texture_free_all(void) {
+    for (int i = 1; i < MAX_TEXTURES; i++) {
+        if (g_texture_used[i]) {
+            UnloadTexture(g_textures[i]);
+            g_textures[i] = (Texture){0};
+            g_texture_used[i] = false;
+        }
+    }
+}
+
+static Texture* texture_get(lua_State *L, int id) {
+    if (id < 1 || id >= MAX_TEXTURES || !g_texture_used[id]) {
+        luaL_error(L, "invalid texture id: %d", id);
+    }
+    return &g_textures[id];
+}
+
+static int l_load_texture(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    Texture tex = LoadTexture(path);
+    if (tex.id == 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "failed to load texture");
+        return 2;
+    }
+    int id = texture_alloc(tex);
+    if (id == 0) {
+        UnloadTexture(tex);   // 槽位已满，立即释放刚加载的纹理，避免 GPU 资源泄漏
+        lua_pushnil(L);
+        lua_pushstring(L, "texture limit reached");
+        return 2;
+    }
+    lua_pushinteger(L, id);
+    lua_pushnil(L);
+    return 2;
+}
+
+static int l_unload_texture(lua_State *L) {
+    int id = (int)luaL_checkinteger(L, 1);
+    if (id >= 1 && id < MAX_TEXTURES && g_texture_used[id]) {
+        UnloadTexture(g_textures[id]);
+        g_textures[id] = (Texture){0};
+        g_texture_used[id] = false;
+    }
+    return 0;
+}
+
+static int l_draw_texture(lua_State *L) {
+    int id = (int)luaL_checkinteger(L, 1);
+    float x = (float)luaL_checknumber(L, 2);
+    float y = (float)luaL_checknumber(L, 3);
+    float w = (float)luaL_optnumber(L, 4, -1);
+    float h = (float)luaL_optnumber(L, 5, -1);
+    int tr = (int)luaL_optinteger(L, 6, 255);
+    int tg = (int)luaL_optinteger(L, 7, 255);
+    int tb = (int)luaL_optinteger(L, 8, 255);
+    int ta = (int)luaL_optinteger(L, 9, 255);
+
+    Texture *tex = texture_get(L, id);
+    Color tint = { (unsigned char)tr, (unsigned char)tg, (unsigned char)tb, (unsigned char)ta };
+
+    if (w < 0) w = (float)tex->width;
+    if (h < 0) h = (float)tex->height;
+
+    Rectangle dst = { x, y, w, h };
+    Rectangle src = { 0, 0, (float)tex->width, (float)tex->height };
+    Vector2 origin = { 0, 0 };
+    DrawTexturePro(*tex, src, dst, origin, 0.0f, tint);
+    return 0;
+}
+
+static int l_draw_texture_ex(lua_State *L) {
+    int id = (int)luaL_checkinteger(L, 1);
+    float sx = (float)luaL_checknumber(L, 2);
+    float sy = (float)luaL_checknumber(L, 3);
+    float sw = (float)luaL_checknumber(L, 4);
+    float sh = (float)luaL_checknumber(L, 5);
+    float dx = (float)luaL_checknumber(L, 6);
+    float dy = (float)luaL_checknumber(L, 7);
+    float dw = (float)luaL_optnumber(L, 8, sw);
+    float dh = (float)luaL_optnumber(L, 9, sh);
+    int tr = (int)luaL_optinteger(L, 10, 255);
+    int tg = (int)luaL_optinteger(L, 11, 255);
+    int tb = (int)luaL_optinteger(L, 12, 255);
+    int ta = (int)luaL_optinteger(L, 13, 255);
+
+    Texture *tex = texture_get(L, id);
+    Color tint = { (unsigned char)tr, (unsigned char)tg, (unsigned char)tb, (unsigned char)ta };
+
+    Rectangle src = { sx, sy, sw, sh };
+    Rectangle dst = { dx, dy, dw, dh };
+    Vector2 origin = { 0, 0 };
+    DrawTexturePro(*tex, src, dst, origin, 0.0f, tint);
+    return 0;
+}
+
+static int l_draw_icon(lua_State *L) {
+    int iconId  = (int)luaL_checkinteger(L, 1);
+    int posX    = (int)luaL_checkinteger(L, 2);
+    int posY    = (int)luaL_checkinteger(L, 3);
+    int pixelSize = (int)luaL_checkinteger(L, 4);
+    int tr = (int)luaL_optinteger(L, 5, 255);
+    int tg = (int)luaL_optinteger(L, 6, 255);
+    int tb = (int)luaL_optinteger(L, 7, 255);
+    int ta = (int)luaL_optinteger(L, 8, 255);
+
+    // 边界检查：GuiDrawIcon 不校验 iconId，越界会读到 guiIcons 数组之外的内存
+    if (iconId < 0 || iconId >= RAYGUI_ICON_MAX_ICONS) {
+        luaL_error(L, "invalid icon id: %d (valid range 0..%d)", iconId, RAYGUI_ICON_MAX_ICONS - 1);
+    }
+
+    Color color = { (unsigned char)tr, (unsigned char)tg, (unsigned char)tb, (unsigned char)ta };
+    GuiDrawIcon(iconId, posX, posY, pixelSize, color);
+    return 0;
+}
+
+static int l_set_icon_scale(lua_State *L) {
+    int scale = (int)luaL_checkinteger(L, 1);
+    GuiSetIconScale(scale);
+    return 0;
+}
+
+static int l_load_style(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    if (!FileExists(path)) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "style file not found");
+        return 2;
+    }
+    GuiLoadStyle(path);
+    // 风格文件可能内嵌字体并调用 GuiSetFont 覆盖我们加载的中文字体；
+    // 重新应用已加载的字体，确保中文/Emoji 仍能正常显示
+    if (g_font.texture.id != 0) {
+        GuiSetFont(g_font);
+    }
+    lua_pushboolean(L, 1);
+    lua_pushnil(L);
+    return 2;
+}
+
+//============================================================================
+// 全局锁定：让 dropdown/combobox 等"展开型"控件能画在最上层。
+// 用法：控件展开时先 lock() 再绘制其它控件（被覆盖区域不会误响应点击），
+// 然后 unlock() 并最后绘制该展开控件本身。
+//============================================================================
+static int l_lock(lua_State *L) {
+    (void)L;
+    GuiLock();
+    return 0;
+}
+
+static int l_unlock(lua_State *L) {
+    (void)L;
+    GuiUnlock();
+    return 0;
+}
+
+static int l_is_locked(lua_State *L) {
+    lua_pushboolean(L, GuiIsLocked());
+    return 1;
+}
+
+//============================================================================
 // 窗口渲染
 //============================================================================
 static int l_init(lua_State *L) {
@@ -208,6 +398,7 @@ static int l_init(lua_State *L) {
 static int l_close(lua_State *L) {
     (void)L;
     font_reset();
+    texture_free_all();
     CloseWindow();
     return 0;
 }
@@ -301,6 +492,13 @@ static int l_progressbar(lua_State *L) {
 //============================================================================
 static int g_cursor_single = 0;
 static int g_cursor_multi  = 0;
+static int g_scroll_multi  = 0;   // 多行框纵向滚动（以"行"为单位）
+
+// 首次按下 + 长按时的系统级自动重复（退格/删除/方向键长按可连续触发）
+static bool key_repeat(int key) {
+    return IsKeyPressed(key) || IsKeyPressedRepeat(key);
+}
+
 static int l_textbox(lua_State *L) {
     Rectangle r = {lua_tonumber(L,1), lua_tonumber(L,2), lua_tonumber(L,3), lua_tonumber(L,4)};
     const char *text_from_lua = luaL_checkstring(L, 5);
@@ -348,7 +546,7 @@ static int l_textbox(lua_State *L) {
         }
 
         // B. 处理左移方向键 (Arrow Left) -> 跨越完整的 UTF-8 字符
-        if (IsKeyPressed(KEY_LEFT)) {
+        if (key_repeat(KEY_LEFT)) {
             if (g_cursor_single > 0) {
                 int prev = g_cursor_single - 1;
                 while (prev > 0 && (g_buf_single[prev] & 0xC0) == 0x80) {
@@ -359,7 +557,7 @@ static int l_textbox(lua_State *L) {
         }
 
         // C. 处理右移方向键 (Arrow Right) -> 跨越完整的 UTF-8 字符
-        if (IsKeyPressed(KEY_RIGHT)) {
+        if (key_repeat(KEY_RIGHT)) {
             if (g_cursor_single < len) {
                 int next = g_cursor_single + 1;
                 while (next < len && (g_buf_single[next] & 0xC0) == 0x80) {
@@ -370,7 +568,7 @@ static int l_textbox(lua_State *L) {
         }
 
         // D. 处理退格键 (Backspace) -> 安全往前删除中英文字符
-        if (IsKeyPressed(KEY_BACKSPACE)) {
+        if (key_repeat(KEY_BACKSPACE)) {
             if (g_cursor_single > 0) {
                 int prev = g_cursor_single - 1;
                 while (prev > 0 && (g_buf_single[prev] & 0xC0) == 0x80) {
@@ -384,7 +582,7 @@ static int l_textbox(lua_State *L) {
         }
 
         // E. 处理删除键 (Delete) -> 安全往后删除中英文字符
-        if (IsKeyPressed(KEY_DELETE)) {
+        if (key_repeat(KEY_DELETE)) {
             if (g_cursor_single < len) {
                 int next = g_cursor_single + 1;
                 while (next < len && (g_buf_single[next] & 0xC0) == 0x80) {
@@ -494,7 +692,7 @@ static int l_textbox_multi(lua_State *L) {
         }
 
         // B. 处理左移键 (Arrow Left)
-        if (IsKeyPressed(KEY_LEFT)) {
+        if (key_repeat(KEY_LEFT)) {
             if (g_cursor_multi > 0) {
                 int prev = g_cursor_multi - 1;
                 while (prev > 0 && (g_buf_multi[prev] & 0xC0) == 0x80) {
@@ -505,7 +703,7 @@ static int l_textbox_multi(lua_State *L) {
         }
 
         // C. 处理右移键 (Arrow Right)
-        if (IsKeyPressed(KEY_RIGHT)) {
+        if (key_repeat(KEY_RIGHT)) {
             if (g_cursor_multi < len) {
                 int next = g_cursor_multi + 1;
                 while (next < len && (g_buf_multi[next] & 0xC0) == 0x80) {
@@ -516,7 +714,7 @@ static int l_textbox_multi(lua_State *L) {
         }
 
         // D. 【新增核心】处理上移键 (Arrow Up) —— 高精确跨行往上迁移
-        if (IsKeyPressed(KEY_UP)) {
+        if (key_repeat(KEY_UP)) {
             int line_start = g_cursor_multi;
             while (line_start > 0 && g_buf_multi[line_start - 1] != '\n') {
                 line_start--;
@@ -543,7 +741,7 @@ static int l_textbox_multi(lua_State *L) {
         }
 
         // E. 【新增核心】处理下移键 (Arrow Down) —— 高精确跨行往下迁移
-        if (IsKeyPressed(KEY_DOWN)) {
+        if (key_repeat(KEY_DOWN)) {
             int line_start = g_cursor_multi;
             while (line_start > 0 && g_buf_multi[line_start - 1] != '\n') {
                 line_start--;
@@ -574,7 +772,7 @@ static int l_textbox_multi(lua_State *L) {
         }
 
         // F. 处理退格键 (Backspace) 中途安全向前删除
-        if (IsKeyPressed(KEY_BACKSPACE)) {
+        if (key_repeat(KEY_BACKSPACE)) {
             if (g_cursor_multi > 0) {
                 int prev = g_cursor_multi - 1;
                 while (prev > 0 && (g_buf_multi[prev] & 0xC0) == 0x80) {
@@ -588,7 +786,7 @@ static int l_textbox_multi(lua_State *L) {
         }
 
         // G. 处理删除键 (Delete) 中途安全向后删除
-        if (IsKeyPressed(KEY_DELETE)) {
+        if (key_repeat(KEY_DELETE)) {
             if (g_cursor_multi < len) {
                 int next = g_cursor_multi + 1;
                 while (next < len && (g_buf_multi[next] & 0xC0) == 0x80) {
@@ -613,56 +811,77 @@ static int l_textbox_multi(lua_State *L) {
 
     font_ensure_text(g_buf_multi);
 
-    // 3. 渲染干净的多行文本框框
-    int oldWrap = GuiGetStyle(DEFAULT, TEXT_WRAP_MODE);
-    int oldAlign = GuiGetStyle(DEFAULT, TEXT_ALIGNMENT);
-    GuiSetStyle(DEFAULT, TEXT_WRAP_MODE, TEXT_WRAP_WORD);
-    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+    // 3. 渲染：手动绘制文本（顶对齐 + 裁剪到框内 + 跟随光标纵向滚动），
+    //    彻底避免内容过多时向上溢出、压到上方其它控件。
+    Font  font     = GuiGetFont();
+    float fontSize = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
+    float spacing  = (float)GuiGetStyle(DEFAULT, TEXT_SPACING);
+    float padding  = (float)GuiGetStyle(DEFAULT, TEXT_PADDING);
+    float lineH    = fontSize + 4.0f;
 
-    GuiTextBox(r, g_buf_multi, TEXT_BUF_MULTI, false); 
+    // 先用 GuiTextBox（空串）画出原生边框与底色，文字我们自己画
+    char empty[1] = {0};
+    GuiTextBox(r, empty, 1, false);
 
-    // 4. 绘制多行模式下的激活外框与精准定位的光标（基于光标所在的当前行独立进行像素测量）
-    if (editMode) {
-        Color activeColor = GetColor(GuiGetStyle(TEXTBOX, BORDER_COLOR_FOCUSED));
-        DrawRectangleLinesEx(r, 1, activeColor);
+    // 光标所在逻辑行、当前行起点、总行数
+    int cursor_line = 0, current_line_start = 0;
+    for (int i = 0; i < g_cursor_multi && g_buf_multi[i]; i++) {
+        if (g_buf_multi[i] == '\n') { cursor_line++; current_line_start = i + 1; }
+    }
+    int total_lines = 1;
+    for (int i = 0; i < len; i++) if (g_buf_multi[i] == '\n') total_lines++;
 
-        Font font = GuiGetFont();
-        float fontSize = GuiGetStyle(DEFAULT, TEXT_SIZE);
-        float padding = GuiGetStyle(DEFAULT, TEXT_PADDING);
+    // 可见行数 + 纵向滚动：保证光标行始终在可视区域内
+    int visible = (int)((r.height - 2.0f * padding) / lineH);
+    if (visible < 1) visible = 1;
+    if (cursor_line < g_scroll_multi)             g_scroll_multi = cursor_line;
+    if (cursor_line >= g_scroll_multi + visible)  g_scroll_multi = cursor_line - visible + 1;
+    int max_scroll = total_lines - visible;
+    if (max_scroll < 0) max_scroll = 0;
+    if (g_scroll_multi > max_scroll) g_scroll_multi = max_scroll;
+    if (g_scroll_multi < 0) g_scroll_multi = 0;
 
-        // 计算当前光标正处于第几行，以及当前行在全局文本里的起始字节偏离值
-        int line_count_before = 0;
-        int current_line_start = 0;
-        for (int i = 0; i < g_cursor_multi && g_buf_multi[i]; i++) {
-            if (g_buf_multi[i] == '\n') {
-                line_count_before++;
-                current_line_start = i + 1;
+    Color textColor = GetColor(GuiGetStyle(TEXTBOX, editMode ? TEXT_COLOR_FOCUSED : TEXT_COLOR_NORMAL));
+
+    // 裁剪到框内，按 \n 逐行绘制，从滚动起点开始
+    BeginScissorMode((int)r.x + 1, (int)r.y + 1, (int)r.width - 2, (int)r.height - 2);
+    {
+        char tmp[TEXT_BUF_MULTI];
+        int line = 0, ls = 0;
+        for (int i = 0; i <= len; i++) {
+            if (i == len || g_buf_multi[i] == '\n') {
+                int seg = i - ls;
+                if (seg > 0 && line >= g_scroll_multi && line < g_scroll_multi + visible + 1) {
+                    memcpy(tmp, g_buf_multi + ls, seg);
+                    tmp[seg] = '\0';
+                    float ty = r.y + padding + (line - g_scroll_multi) * lineH;
+                    DrawTextEx(font, tmp, (Vector2){ r.x + padding, ty }, fontSize, spacing, textColor);
+                }
+                line++;
+                ls = i + 1;
             }
         }
 
-        // 完美截取当前行文本直到光标切面处的子字符串
-        char cur_line_sub[TEXT_BUF_MULTI];
-        int sub_len = g_cursor_multi - current_line_start;
-        if (sub_len < 0) sub_len = 0;
-        memcpy(cur_line_sub, g_buf_multi + current_line_start, sub_len);
-        cur_line_sub[sub_len] = '\0';
-
-        Vector2 subSize = MeasureTextEx(font, cur_line_sub, fontSize, 1);
-
-        float cursor_x = r.x + padding + subSize.x + 2;
-        float cursor_y = r.y + padding + line_count_before * (fontSize + 4) + fontSize / 2;
-
-        if (cursor_y < r.y + r.height - padding) {
-            DrawLineV(
-                (Vector2){ cursor_x, cursor_y - fontSize / 2 },
-                (Vector2){ cursor_x, cursor_y + fontSize / 2 },
-                activeColor
-            );
+        // 光标（跟随滚动）
+        if (editMode) {
+            char cur_sub[TEXT_BUF_MULTI];
+            int sub_len = g_cursor_multi - current_line_start;
+            if (sub_len < 0) sub_len = 0;
+            memcpy(cur_sub, g_buf_multi + current_line_start, sub_len);
+            cur_sub[sub_len] = '\0';
+            Vector2 sz = MeasureTextEx(font, cur_sub, fontSize, spacing);
+            float cx = r.x + padding + sz.x + 1;
+            float cy = r.y + padding + (cursor_line - g_scroll_multi) * lineH;
+            DrawLineV((Vector2){ cx, cy }, (Vector2){ cx, cy + fontSize },
+                      GetColor(GuiGetStyle(TEXTBOX, BORDER_COLOR_FOCUSED)));
         }
     }
+    EndScissorMode();
 
-    GuiSetStyle(DEFAULT, TEXT_WRAP_MODE, oldWrap);
-    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, oldAlign);
+    // 聚焦高亮外框
+    if (editMode) {
+        DrawRectangleLinesEx(r, 1, GetColor(GuiGetStyle(TEXTBOX, BORDER_COLOR_FOCUSED)));
+    }
 
     lua_pushstring(L, g_buf_multi);
     lua_pushboolean(L, editMode);
@@ -692,8 +911,26 @@ static int l_window(lua_State *L) {
     Rectangle r = {lua_tonumber(L,1),lua_tonumber(L,2),lua_tonumber(L,3),lua_tonumber(L,4)};
     const char *text = luaL_checkstring(L,5);
     font_ensure_text(text);
-    GuiWindowBox(r, text);
-    lua_pushboolean(L, false);
+    check_mouse_hover(r);
+    // GuiWindowBox = 面板 + 标题栏 + 右上角 ✖ 关闭按钮；点击 ✖ 时返回 true
+    int closed = GuiWindowBox(r, text);
+    lua_pushboolean(L, closed);
+    return 1;
+}
+
+// 模态消息/确认框：buttons 用分号分隔，如 "取消;确定"
+// 返回：-1=未点击(对话框继续显示)，0=点了右上角 ✖，1=第1个按钮，2=第2个按钮 …
+static int l_messagebox(lua_State *L) {
+    Rectangle r = {lua_tonumber(L,1),lua_tonumber(L,2),lua_tonumber(L,3),lua_tonumber(L,4)};
+    const char *title   = luaL_checkstring(L, 5);
+    const char *message = luaL_checkstring(L, 6);
+    const char *buttons = luaL_checkstring(L, 7);
+    font_ensure_text(title);
+    font_ensure_text(message);
+    font_ensure_text(buttons);
+    check_mouse_hover(r);
+    int result = GuiMessageBox(r, title, message, buttons);
+    lua_pushinteger(L, result);
     return 1;
 }
 
@@ -810,15 +1047,27 @@ static const luaL_Reg raygui_lib[] = {
     {"panel",           l_panel},
     {"group",           l_group},
     {"window",          l_window},
+    {"messagebox",      l_messagebox},
     {"dropdown",        l_dropdown},
     {"listview",        l_listview},
     {"is_mouse_over_ui",l_is_mouse_over_ui},
     {"set_style",       l_set_style},
     {"load_font",       l_load_font},
+    {"load_texture",    l_load_texture},
+    {"unload_texture",  l_unload_texture},
+    {"draw_texture",    l_draw_texture},
+    {"draw_texture_ex", l_draw_texture_ex},
+    {"draw_icon",       l_draw_icon},
+    {"set_icon_scale",  l_set_icon_scale},
+    {"load_style",      l_load_style},
+    {"lock",            l_lock},
+    {"unlock",          l_unlock},
+    {"is_locked",       l_is_locked},
     {NULL, NULL}
 };
 
 static void register_consts(lua_State *L) {
+    // Style constants
     lua_pushinteger(L, 0); lua_setfield(L, -2, "DEFAULT");
     lua_pushinteger(L, 14); lua_setfield(L, -2, "TEXT_ALIGNMENT");
     lua_pushinteger(L, 16); lua_setfield(L, -2, "TEXT_SIZE");
@@ -826,9 +1075,290 @@ static void register_consts(lua_State *L) {
     lua_pushinteger(L, 0); lua_setfield(L, -2, "TEXT_ALIGN_LEFT");
     lua_pushinteger(L, 1); lua_setfield(L, -2, "TEXT_ALIGN_CENTER");
     lua_pushinteger(L, 2); lua_setfield(L, -2, "TEXT_ALIGN_RIGHT");
+
+    // Color & border style properties
+    lua_pushinteger(L, 0);  lua_setfield(L, -2, "BORDER_COLOR_NORMAL");
+    lua_pushinteger(L, 1);  lua_setfield(L, -2, "BASE_COLOR_NORMAL");
+    lua_pushinteger(L, 2);  lua_setfield(L, -2, "TEXT_COLOR_NORMAL");
+    lua_pushinteger(L, 3);  lua_setfield(L, -2, "BORDER_COLOR_FOCUSED");
+    lua_pushinteger(L, 4);  lua_setfield(L, -2, "BASE_COLOR_FOCUSED");
+    lua_pushinteger(L, 5);  lua_setfield(L, -2, "TEXT_COLOR_FOCUSED");
+    lua_pushinteger(L, 6);  lua_setfield(L, -2, "BORDER_COLOR_PRESSED");
+    lua_pushinteger(L, 7);  lua_setfield(L, -2, "BASE_COLOR_PRESSED");
+    lua_pushinteger(L, 8);  lua_setfield(L, -2, "TEXT_COLOR_PRESSED");
+    lua_pushinteger(L, 9);  lua_setfield(L, -2, "BORDER_COLOR_DISABLED");
+    lua_pushinteger(L, 10); lua_setfield(L, -2, "BASE_COLOR_DISABLED");
+    lua_pushinteger(L, 11); lua_setfield(L, -2, "TEXT_COLOR_DISABLED");
+    lua_pushinteger(L, 12); lua_setfield(L, -2, "BORDER_WIDTH");
+    lua_pushinteger(L, 17); lua_setfield(L, -2, "TEXT_SPACING");
+    lua_pushinteger(L, 18); lua_setfield(L, -2, "LINE_COLOR");
+    lua_pushinteger(L, 19); lua_setfield(L, -2, "BACKGROUND_COLOR");
+    lua_pushinteger(L, 20); lua_setfield(L, -2, "TEXT_LINE_SPACING");
+
+    // Control type IDs
+    lua_pushinteger(L, 1); lua_setfield(L, -2, "LABEL");
+    lua_pushinteger(L, 2); lua_setfield(L, -2, "BUTTON");
+    lua_pushinteger(L, 3); lua_setfield(L, -2, "TOGGLE");
+    lua_pushinteger(L, 4); lua_setfield(L, -2, "SLIDER");
+    lua_pushinteger(L, 5); lua_setfield(L, -2, "PROGRESSBAR");
+    lua_pushinteger(L, 6); lua_setfield(L, -2, "CHECKBOX");
+    lua_pushinteger(L, 9); lua_setfield(L, -2, "TEXTBOX");
+    lua_pushinteger(L, 10); lua_setfield(L, -2, "VALUEBOX");
+
+    // Icon constants (raygui ricons 4.x)
+    lua_pushinteger(L, 0);   lua_setfield(L, -2, "ICON_NONE");
+    lua_pushinteger(L, 1);   lua_setfield(L, -2, "ICON_FOLDER_FILE_OPEN");
+    lua_pushinteger(L, 2);   lua_setfield(L, -2, "ICON_FILE_SAVE_CLASSIC");
+    lua_pushinteger(L, 3);   lua_setfield(L, -2, "ICON_FOLDER_OPEN");
+    lua_pushinteger(L, 4);   lua_setfield(L, -2, "ICON_FOLDER_SAVE");
+    lua_pushinteger(L, 5);   lua_setfield(L, -2, "ICON_FILE_OPEN");
+    lua_pushinteger(L, 6);   lua_setfield(L, -2, "ICON_FILE_SAVE");
+    lua_pushinteger(L, 7);   lua_setfield(L, -2, "ICON_FILE_EXPORT");
+    lua_pushinteger(L, 8);   lua_setfield(L, -2, "ICON_FILE_ADD");
+    lua_pushinteger(L, 9);   lua_setfield(L, -2, "ICON_FILE_DELETE");
+    lua_pushinteger(L, 10);  lua_setfield(L, -2, "ICON_FILETYPE_TEXT");
+    lua_pushinteger(L, 11);  lua_setfield(L, -2, "ICON_FILETYPE_AUDIO");
+    lua_pushinteger(L, 12);  lua_setfield(L, -2, "ICON_FILETYPE_IMAGE");
+    lua_pushinteger(L, 13);  lua_setfield(L, -2, "ICON_FILETYPE_PLAY");
+    lua_pushinteger(L, 14);  lua_setfield(L, -2, "ICON_FILETYPE_VIDEO");
+    lua_pushinteger(L, 15);  lua_setfield(L, -2, "ICON_FILETYPE_INFO");
+    lua_pushinteger(L, 16);  lua_setfield(L, -2, "ICON_FILE_COPY");
+    lua_pushinteger(L, 17);  lua_setfield(L, -2, "ICON_FILE_CUT");
+    lua_pushinteger(L, 18);  lua_setfield(L, -2, "ICON_FILE_PASTE");
+    lua_pushinteger(L, 19);  lua_setfield(L, -2, "ICON_CURSOR_HAND");
+    lua_pushinteger(L, 20);  lua_setfield(L, -2, "ICON_CURSOR_POINTER");
+    lua_pushinteger(L, 21);  lua_setfield(L, -2, "ICON_CURSOR_CLASSIC");
+    lua_pushinteger(L, 22);  lua_setfield(L, -2, "ICON_PENCIL");
+    lua_pushinteger(L, 23);  lua_setfield(L, -2, "ICON_PENCIL_BIG");
+    lua_pushinteger(L, 24);  lua_setfield(L, -2, "ICON_BRUSH_CLASSIC");
+    lua_pushinteger(L, 25);  lua_setfield(L, -2, "ICON_BRUSH_PAINTER");
+    lua_pushinteger(L, 26);  lua_setfield(L, -2, "ICON_WATER_DROP");
+    lua_pushinteger(L, 27);  lua_setfield(L, -2, "ICON_COLOR_PICKER");
+    lua_pushinteger(L, 28);  lua_setfield(L, -2, "ICON_RUBBER");
+    lua_pushinteger(L, 29);  lua_setfield(L, -2, "ICON_COLOR_BUCKET");
+    lua_pushinteger(L, 30);  lua_setfield(L, -2, "ICON_TEXT_T");
+    lua_pushinteger(L, 31);  lua_setfield(L, -2, "ICON_TEXT_A");
+    lua_pushinteger(L, 32);  lua_setfield(L, -2, "ICON_SCALE");
+    lua_pushinteger(L, 33);  lua_setfield(L, -2, "ICON_RESIZE");
+    lua_pushinteger(L, 34);  lua_setfield(L, -2, "ICON_FILTER_POINT");
+    lua_pushinteger(L, 35);  lua_setfield(L, -2, "ICON_FILTER_BILINEAR");
+    lua_pushinteger(L, 36);  lua_setfield(L, -2, "ICON_CROP");
+    lua_pushinteger(L, 37);  lua_setfield(L, -2, "ICON_CROP_ALPHA");
+    lua_pushinteger(L, 38);  lua_setfield(L, -2, "ICON_SQUARE_TOGGLE");
+    lua_pushinteger(L, 39);  lua_setfield(L, -2, "ICON_SYMMETRY");
+    lua_pushinteger(L, 40);  lua_setfield(L, -2, "ICON_SYMMETRY_HORIZONTAL");
+    lua_pushinteger(L, 41);  lua_setfield(L, -2, "ICON_SYMMETRY_VERTICAL");
+    lua_pushinteger(L, 42);  lua_setfield(L, -2, "ICON_LENS");
+    lua_pushinteger(L, 43);  lua_setfield(L, -2, "ICON_LENS_BIG");
+    lua_pushinteger(L, 44);  lua_setfield(L, -2, "ICON_EYE_ON");
+    lua_pushinteger(L, 45);  lua_setfield(L, -2, "ICON_EYE_OFF");
+    lua_pushinteger(L, 46);  lua_setfield(L, -2, "ICON_FILTER_TOP");
+    lua_pushinteger(L, 47);  lua_setfield(L, -2, "ICON_FILTER");
+    lua_pushinteger(L, 48);  lua_setfield(L, -2, "ICON_TARGET_POINT");
+    lua_pushinteger(L, 49);  lua_setfield(L, -2, "ICON_TARGET_SMALL");
+    lua_pushinteger(L, 50);  lua_setfield(L, -2, "ICON_TARGET_BIG");
+    lua_pushinteger(L, 51);  lua_setfield(L, -2, "ICON_TARGET_MOVE");
+    lua_pushinteger(L, 52);  lua_setfield(L, -2, "ICON_CURSOR_MOVE");
+    lua_pushinteger(L, 53);  lua_setfield(L, -2, "ICON_CURSOR_SCALE");
+    lua_pushinteger(L, 54);  lua_setfield(L, -2, "ICON_CURSOR_SCALE_RIGHT");
+    lua_pushinteger(L, 55);  lua_setfield(L, -2, "ICON_CURSOR_SCALE_LEFT");
+    lua_pushinteger(L, 56);  lua_setfield(L, -2, "ICON_UNDO");
+    lua_pushinteger(L, 57);  lua_setfield(L, -2, "ICON_REDO");
+    lua_pushinteger(L, 58);  lua_setfield(L, -2, "ICON_REREDO");
+    lua_pushinteger(L, 59);  lua_setfield(L, -2, "ICON_MUTATE");
+    lua_pushinteger(L, 60);  lua_setfield(L, -2, "ICON_ROTATE");
+    lua_pushinteger(L, 61);  lua_setfield(L, -2, "ICON_REPEAT");
+    lua_pushinteger(L, 62);  lua_setfield(L, -2, "ICON_SHUFFLE");
+    lua_pushinteger(L, 63);  lua_setfield(L, -2, "ICON_EMPTYBOX");
+    lua_pushinteger(L, 64);  lua_setfield(L, -2, "ICON_TARGET");
+    lua_pushinteger(L, 65);  lua_setfield(L, -2, "ICON_TARGET_SMALL_FILL");
+    lua_pushinteger(L, 66);  lua_setfield(L, -2, "ICON_TARGET_BIG_FILL");
+    lua_pushinteger(L, 67);  lua_setfield(L, -2, "ICON_TARGET_MOVE_FILL");
+    lua_pushinteger(L, 68);  lua_setfield(L, -2, "ICON_CURSOR_MOVE_FILL");
+    lua_pushinteger(L, 69);  lua_setfield(L, -2, "ICON_CURSOR_SCALE_FILL");
+    lua_pushinteger(L, 70);  lua_setfield(L, -2, "ICON_CURSOR_SCALE_RIGHT_FILL");
+    lua_pushinteger(L, 71);  lua_setfield(L, -2, "ICON_CURSOR_SCALE_LEFT_FILL");
+    lua_pushinteger(L, 72);  lua_setfield(L, -2, "ICON_UNDO_FILL");
+    lua_pushinteger(L, 73);  lua_setfield(L, -2, "ICON_REDO_FILL");
+    lua_pushinteger(L, 74);  lua_setfield(L, -2, "ICON_REREDO_FILL");
+    lua_pushinteger(L, 75);  lua_setfield(L, -2, "ICON_MUTATE_FILL");
+    lua_pushinteger(L, 76);  lua_setfield(L, -2, "ICON_ROTATE_FILL");
+    lua_pushinteger(L, 77);  lua_setfield(L, -2, "ICON_REPEAT_FILL");
+    lua_pushinteger(L, 78);  lua_setfield(L, -2, "ICON_SHUFFLE_FILL");
+    lua_pushinteger(L, 79);  lua_setfield(L, -2, "ICON_EMPTYBOX_SMALL");
+    lua_pushinteger(L, 80);  lua_setfield(L, -2, "ICON_BOX");
+    lua_pushinteger(L, 81);  lua_setfield(L, -2, "ICON_BOX_TOP");
+    lua_pushinteger(L, 82);  lua_setfield(L, -2, "ICON_BOX_TOP_RIGHT");
+    lua_pushinteger(L, 83);  lua_setfield(L, -2, "ICON_BOX_RIGHT");
+    lua_pushinteger(L, 84);  lua_setfield(L, -2, "ICON_BOX_BOTTOM_RIGHT");
+    lua_pushinteger(L, 85);  lua_setfield(L, -2, "ICON_BOX_BOTTOM");
+    lua_pushinteger(L, 86);  lua_setfield(L, -2, "ICON_BOX_BOTTOM_LEFT");
+    lua_pushinteger(L, 87);  lua_setfield(L, -2, "ICON_BOX_LEFT");
+    lua_pushinteger(L, 88);  lua_setfield(L, -2, "ICON_BOX_TOP_LEFT");
+    lua_pushinteger(L, 89);  lua_setfield(L, -2, "ICON_BOX_CENTER");
+    lua_pushinteger(L, 90);  lua_setfield(L, -2, "ICON_BOX_CIRCLE_MASK");
+    lua_pushinteger(L, 91);  lua_setfield(L, -2, "ICON_POT");
+    lua_pushinteger(L, 92);  lua_setfield(L, -2, "ICON_ALPHA_MULTIPLY");
+    lua_pushinteger(L, 93);  lua_setfield(L, -2, "ICON_ALPHA_CLEAR");
+    lua_pushinteger(L, 94);  lua_setfield(L, -2, "ICON_DITHERING");
+    lua_pushinteger(L, 95);  lua_setfield(L, -2, "ICON_MIPMAPS");
+    lua_pushinteger(L, 96);  lua_setfield(L, -2, "ICON_BOX_GRID");
+    lua_pushinteger(L, 97);  lua_setfield(L, -2, "ICON_GRID");
+    lua_pushinteger(L, 98);  lua_setfield(L, -2, "ICON_BOX_CORNERS_SMALL");
+    lua_pushinteger(L, 99);  lua_setfield(L, -2, "ICON_BOX_CORNERS_BIG");
+    lua_pushinteger(L, 100); lua_setfield(L, -2, "ICON_FOUR_BOXES");
+    lua_pushinteger(L, 101); lua_setfield(L, -2, "ICON_GRID_FILL");
+    lua_pushinteger(L, 102); lua_setfield(L, -2, "ICON_BOX_MULTISIZE");
+    lua_pushinteger(L, 103); lua_setfield(L, -2, "ICON_ZOOM_SMALL");
+    lua_pushinteger(L, 104); lua_setfield(L, -2, "ICON_ZOOM_MEDIUM");
+    lua_pushinteger(L, 105); lua_setfield(L, -2, "ICON_ZOOM_BIG");
+    lua_pushinteger(L, 106); lua_setfield(L, -2, "ICON_ZOOM_ALL");
+    lua_pushinteger(L, 107); lua_setfield(L, -2, "ICON_ZOOM_CENTER");
+    lua_pushinteger(L, 108); lua_setfield(L, -2, "ICON_BOX_DOTS_SMALL");
+    lua_pushinteger(L, 109); lua_setfield(L, -2, "ICON_BOX_DOTS_BIG");
+    lua_pushinteger(L, 110); lua_setfield(L, -2, "ICON_BOX_CONCENTRIC");
+    lua_pushinteger(L, 111); lua_setfield(L, -2, "ICON_BOX_GRID_BIG");
+    lua_pushinteger(L, 112); lua_setfield(L, -2, "ICON_OK_TICK");
+    lua_pushinteger(L, 113); lua_setfield(L, -2, "ICON_CROSS");
+    lua_pushinteger(L, 114); lua_setfield(L, -2, "ICON_ARROW_LEFT");
+    lua_pushinteger(L, 115); lua_setfield(L, -2, "ICON_ARROW_RIGHT");
+    lua_pushinteger(L, 116); lua_setfield(L, -2, "ICON_ARROW_DOWN");
+    lua_pushinteger(L, 117); lua_setfield(L, -2, "ICON_ARROW_UP");
+    lua_pushinteger(L, 118); lua_setfield(L, -2, "ICON_ARROW_LEFT_FILL");
+    lua_pushinteger(L, 119); lua_setfield(L, -2, "ICON_ARROW_RIGHT_FILL");
+    lua_pushinteger(L, 120); lua_setfield(L, -2, "ICON_ARROW_DOWN_FILL");
+    lua_pushinteger(L, 121); lua_setfield(L, -2, "ICON_ARROW_UP_FILL");
+    lua_pushinteger(L, 122); lua_setfield(L, -2, "ICON_AUDIO");
+    lua_pushinteger(L, 123); lua_setfield(L, -2, "ICON_FX");
+    lua_pushinteger(L, 124); lua_setfield(L, -2, "ICON_WAVE");
+    lua_pushinteger(L, 125); lua_setfield(L, -2, "ICON_WAVE_SINUS");
+    lua_pushinteger(L, 126); lua_setfield(L, -2, "ICON_WAVE_SQUARE");
+    lua_pushinteger(L, 127); lua_setfield(L, -2, "ICON_WAVE_TRIANGULAR");
+    lua_pushinteger(L, 128); lua_setfield(L, -2, "ICON_CROSS_SMALL");
+    lua_pushinteger(L, 129); lua_setfield(L, -2, "ICON_PLAYER_PREVIOUS");
+    lua_pushinteger(L, 130); lua_setfield(L, -2, "ICON_PLAYER_PLAY_BACK");
+    lua_pushinteger(L, 131); lua_setfield(L, -2, "ICON_PLAYER_PLAY");
+    lua_pushinteger(L, 132); lua_setfield(L, -2, "ICON_PLAYER_PAUSE");
+    lua_pushinteger(L, 133); lua_setfield(L, -2, "ICON_PLAYER_STOP");
+    lua_pushinteger(L, 134); lua_setfield(L, -2, "ICON_PLAYER_NEXT");
+    lua_pushinteger(L, 135); lua_setfield(L, -2, "ICON_PLAYER_RECORD");
+    lua_pushinteger(L, 136); lua_setfield(L, -2, "ICON_MAGNET");
+    lua_pushinteger(L, 137); lua_setfield(L, -2, "ICON_LOCK_CLOSE");
+    lua_pushinteger(L, 138); lua_setfield(L, -2, "ICON_LOCK_OPEN");
+    lua_pushinteger(L, 139); lua_setfield(L, -2, "ICON_CLOCK");
+    lua_pushinteger(L, 140); lua_setfield(L, -2, "ICON_TOOLS");
+    lua_pushinteger(L, 141); lua_setfield(L, -2, "ICON_GEAR");
+    lua_pushinteger(L, 142); lua_setfield(L, -2, "ICON_GEAR_BIG");
+    lua_pushinteger(L, 143); lua_setfield(L, -2, "ICON_BIN");
+    lua_pushinteger(L, 144); lua_setfield(L, -2, "ICON_HAND_POINTER");
+    lua_pushinteger(L, 145); lua_setfield(L, -2, "ICON_LASER");
+    lua_pushinteger(L, 146); lua_setfield(L, -2, "ICON_COIN");
+    lua_pushinteger(L, 147); lua_setfield(L, -2, "ICON_EXPLOSION");
+    lua_pushinteger(L, 148); lua_setfield(L, -2, "ICON_1UP");
+    lua_pushinteger(L, 149); lua_setfield(L, -2, "ICON_PLAYER");
+    lua_pushinteger(L, 150); lua_setfield(L, -2, "ICON_PLAYER_JUMP");
+    lua_pushinteger(L, 151); lua_setfield(L, -2, "ICON_KEY");
+    lua_pushinteger(L, 152); lua_setfield(L, -2, "ICON_DEMON");
+    lua_pushinteger(L, 153); lua_setfield(L, -2, "ICON_TEXT_POPUP");
+    lua_pushinteger(L, 154); lua_setfield(L, -2, "ICON_GEAR_EX");
+    lua_pushinteger(L, 155); lua_setfield(L, -2, "ICON_CRACK");
+    lua_pushinteger(L, 156); lua_setfield(L, -2, "ICON_CRACK_POINTS");
+    lua_pushinteger(L, 157); lua_setfield(L, -2, "ICON_STAR");
+    lua_pushinteger(L, 158); lua_setfield(L, -2, "ICON_DOOR");
+    lua_pushinteger(L, 159); lua_setfield(L, -2, "ICON_EXIT");
+    lua_pushinteger(L, 160); lua_setfield(L, -2, "ICON_MODE_2D");
+    lua_pushinteger(L, 161); lua_setfield(L, -2, "ICON_MODE_3D");
+    lua_pushinteger(L, 162); lua_setfield(L, -2, "ICON_CUBE");
+    lua_pushinteger(L, 163); lua_setfield(L, -2, "ICON_CUBE_FACE_TOP");
+    lua_pushinteger(L, 164); lua_setfield(L, -2, "ICON_CUBE_FACE_LEFT");
+    lua_pushinteger(L, 165); lua_setfield(L, -2, "ICON_CUBE_FACE_FRONT");
+    lua_pushinteger(L, 166); lua_setfield(L, -2, "ICON_CUBE_FACE_BOTTOM");
+    lua_pushinteger(L, 167); lua_setfield(L, -2, "ICON_CUBE_FACE_RIGHT");
+    lua_pushinteger(L, 168); lua_setfield(L, -2, "ICON_CUBE_FACE_BACK");
+    lua_pushinteger(L, 169); lua_setfield(L, -2, "ICON_CAMERA");
+    lua_pushinteger(L, 170); lua_setfield(L, -2, "ICON_SPECIAL");
+    lua_pushinteger(L, 171); lua_setfield(L, -2, "ICON_LINK_NET");
+    lua_pushinteger(L, 172); lua_setfield(L, -2, "ICON_LINK_BOXES");
+    lua_pushinteger(L, 173); lua_setfield(L, -2, "ICON_LINK_MULTI");
+    lua_pushinteger(L, 174); lua_setfield(L, -2, "ICON_LINK");
+    lua_pushinteger(L, 175); lua_setfield(L, -2, "ICON_LINK_BROKE");
+    lua_pushinteger(L, 176); lua_setfield(L, -2, "ICON_TEXT_NOTES");
+    lua_pushinteger(L, 177); lua_setfield(L, -2, "ICON_NOTEBOOK");
+    lua_pushinteger(L, 178); lua_setfield(L, -2, "ICON_SUITCASE");
+    lua_pushinteger(L, 179); lua_setfield(L, -2, "ICON_SUITCASE_ZIP");
+    lua_pushinteger(L, 180); lua_setfield(L, -2, "ICON_MAILBOX");
+    lua_pushinteger(L, 181); lua_setfield(L, -2, "ICON_MONITOR");
+    lua_pushinteger(L, 182); lua_setfield(L, -2, "ICON_PRINTER");
+    lua_pushinteger(L, 183); lua_setfield(L, -2, "ICON_PHOTO_CAMERA");
+    lua_pushinteger(L, 184); lua_setfield(L, -2, "ICON_PHOTO_CAMERA_FLASH");
+    lua_pushinteger(L, 185); lua_setfield(L, -2, "ICON_HOUSE");
+    lua_pushinteger(L, 186); lua_setfield(L, -2, "ICON_HEART");
+    lua_pushinteger(L, 187); lua_setfield(L, -2, "ICON_CORNER");
+    lua_pushinteger(L, 188); lua_setfield(L, -2, "ICON_VERTICAL_BARS");
+    lua_pushinteger(L, 189); lua_setfield(L, -2, "ICON_VERTICAL_BARS_FILL");
+    lua_pushinteger(L, 190); lua_setfield(L, -2, "ICON_LIFE_BARS");
+    lua_pushinteger(L, 191); lua_setfield(L, -2, "ICON_INFO");
+    lua_pushinteger(L, 192); lua_setfield(L, -2, "ICON_CROSSLINE");
+    lua_pushinteger(L, 193); lua_setfield(L, -2, "ICON_HELP");
+    lua_pushinteger(L, 194); lua_setfield(L, -2, "ICON_FILETYPE_ALPHA");
+    lua_pushinteger(L, 195); lua_setfield(L, -2, "ICON_FILETYPE_HOME");
+    lua_pushinteger(L, 196); lua_setfield(L, -2, "ICON_LAYERS_VISIBLE");
+    lua_pushinteger(L, 197); lua_setfield(L, -2, "ICON_LAYERS");
+    lua_pushinteger(L, 198); lua_setfield(L, -2, "ICON_WINDOW");
+    lua_pushinteger(L, 199); lua_setfield(L, -2, "ICON_HIDPI");
+    lua_pushinteger(L, 200); lua_setfield(L, -2, "ICON_FILETYPE_BINARY");
+    lua_pushinteger(L, 201); lua_setfield(L, -2, "ICON_HEX");
+    lua_pushinteger(L, 202); lua_setfield(L, -2, "ICON_SHIELD");
+    lua_pushinteger(L, 203); lua_setfield(L, -2, "ICON_FILE_NEW");
+    lua_pushinteger(L, 204); lua_setfield(L, -2, "ICON_FOLDER_ADD");
+    lua_pushinteger(L, 205); lua_setfield(L, -2, "ICON_ALARM");
+    lua_pushinteger(L, 206); lua_setfield(L, -2, "ICON_CPU");
+    lua_pushinteger(L, 207); lua_setfield(L, -2, "ICON_ROM");
+    lua_pushinteger(L, 208); lua_setfield(L, -2, "ICON_STEP_OVER");
+    lua_pushinteger(L, 209); lua_setfield(L, -2, "ICON_STEP_INTO");
+    lua_pushinteger(L, 210); lua_setfield(L, -2, "ICON_STEP_OUT");
+    lua_pushinteger(L, 211); lua_setfield(L, -2, "ICON_RESTART");
+    lua_pushinteger(L, 212); lua_setfield(L, -2, "ICON_BREAKPOINT_ON");
+    lua_pushinteger(L, 213); lua_setfield(L, -2, "ICON_BREAKPOINT_OFF");
+    lua_pushinteger(L, 214); lua_setfield(L, -2, "ICON_BURGER_MENU");
+    lua_pushinteger(L, 215); lua_setfield(L, -2, "ICON_CASE_SENSITIVE");
+    lua_pushinteger(L, 216); lua_setfield(L, -2, "ICON_REG_EXP");
+    lua_pushinteger(L, 217); lua_setfield(L, -2, "ICON_FOLDER");
+    lua_pushinteger(L, 218); lua_setfield(L, -2, "ICON_FILE");
+    lua_pushinteger(L, 219); lua_setfield(L, -2, "ICON_SAND_TIMER");
+    lua_pushinteger(L, 220); lua_setfield(L, -2, "ICON_WARNING");
+    lua_pushinteger(L, 221); lua_setfield(L, -2, "ICON_HELP_BOX");
+    lua_pushinteger(L, 222); lua_setfield(L, -2, "ICON_INFO_BOX");
+    lua_pushinteger(L, 223); lua_setfield(L, -2, "ICON_PRIORITY");
+    lua_pushinteger(L, 224); lua_setfield(L, -2, "ICON_LAYERS_ISO");
+    lua_pushinteger(L, 225); lua_setfield(L, -2, "ICON_LAYERS2");
+    lua_pushinteger(L, 226); lua_setfield(L, -2, "ICON_MLAYERS");
+    lua_pushinteger(L, 227); lua_setfield(L, -2, "ICON_MAPS");
+    lua_pushinteger(L, 228); lua_setfield(L, -2, "ICON_HOT");
+    lua_pushinteger(L, 229); lua_setfield(L, -2, "ICON_LABEL");
+    lua_pushinteger(L, 230); lua_setfield(L, -2, "ICON_NAME_ID");
+    lua_pushinteger(L, 231); lua_setfield(L, -2, "ICON_SLICING");
+    lua_pushinteger(L, 232); lua_setfield(L, -2, "ICON_MANUAL_CONTROL");
+    lua_pushinteger(L, 233); lua_setfield(L, -2, "ICON_COLLISION");
+    lua_pushinteger(L, 234); lua_setfield(L, -2, "ICON_CIRCLE_ADD");
+    lua_pushinteger(L, 235); lua_setfield(L, -2, "ICON_CIRCLE_ADD_FILL");
+    lua_pushinteger(L, 236); lua_setfield(L, -2, "ICON_CIRCLE_WARNING");
+    lua_pushinteger(L, 237); lua_setfield(L, -2, "ICON_CIRCLE_WARNING_FILL");
+    lua_pushinteger(L, 238); lua_setfield(L, -2, "ICON_BOX_MORE");
+    lua_pushinteger(L, 239); lua_setfield(L, -2, "ICON_BOX_MORE_FILL");
+    lua_pushinteger(L, 240); lua_setfield(L, -2, "ICON_BOX_MINUS");
+    lua_pushinteger(L, 241); lua_setfield(L, -2, "ICON_BOX_MINUS_FILL");
+    lua_pushinteger(L, 242); lua_setfield(L, -2, "ICON_UNION");
+    lua_pushinteger(L, 243); lua_setfield(L, -2, "ICON_INTERSECTION");
+    lua_pushinteger(L, 244); lua_setfield(L, -2, "ICON_DIFFERENCE");
+    lua_pushinteger(L, 245); lua_setfield(L, -2, "ICON_SPHERE");
+    lua_pushinteger(L, 246); lua_setfield(L, -2, "ICON_CYLINDER");
+    lua_pushinteger(L, 247); lua_setfield(L, -2, "ICON_CONE");
+    lua_pushinteger(L, 248); lua_setfield(L, -2, "ICON_ELLIPSOID");
+    lua_pushinteger(L, 249); lua_setfield(L, -2, "ICON_CAPSULE");
 }
 
-int luaopen_raygui(lua_State *L) {
+EXPORT int luaopen_raygui(lua_State *L) {
     luaL_newlib(L, raygui_lib);
     register_consts(L);
     return 1;
