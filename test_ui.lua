@@ -47,6 +47,28 @@ local list_scroll = 0
 local confirm_open = false        -- 确认对话框是否弹出
 local confirm_result = ""         -- 上次对话框的选择结果（用于显示）
 
+-- 背包（游戏物品栏）状态：用 emoji 当物品图标
+local bag_open = false
+local bag_selected = nil          -- 选中的格子序号（0 起）
+local bag_items = {
+    {emoji="gem",    name="宝石",   count=12},
+    {emoji="key",    name="钥匙",   count=3},
+    {emoji="book",   name="技能书", count=1},
+    {emoji="coffee", name="药水",   count=5},
+    {emoji="fire",   name="火符",   count=9},
+    {emoji="star",   name="星石",   count=99},
+    {emoji="heart",  name="红心",   count=20},
+    {emoji="bulb",   name="灯泡",   count=2},
+    {emoji="rocket", name="火箭",   count=1},
+    {emoji="crown",  name="王冠",   count=1},
+    {emoji="trophy", name="奖杯",   count=1},
+    {emoji="shield", name="护盾",   count=4},
+    {emoji="hammer", name="锤子",   count=7},
+    {emoji="map",    name="地图",   count=2},
+    {emoji="gift",   name="礼包",   count=6},
+    {emoji="music",  name="乐符",   count=8},
+}
+
 -- 预加载贴图（raygui.init 已创建窗口/GL 上下文，此时可加载纹理）
 local emoji_tex = raygui.load_texture(script_dir() .. "/emoji_atlas.png")
 -- emoji 图集元数据：cell/cols 为图集网格，index 是 名字->序号（与 emoji_atlas.png 对应）。
@@ -106,6 +128,61 @@ local function emoji_button(x, y, w, h, key, text)
     return clicked
 end
 
+-- 游戏背包窗口（模态）：标题栏 + ✖ 关闭 + 物品格子(emoji 当图标) + 右侧详情
+local function draw_backpack()
+    local bw, bh = 520, 410
+    local bx, by = (910 - bw) // 2, (870 - bh) // 2   -- 居中
+
+    -- 窗口框（GuiWindowBox = 面板 + 标题栏 + 右上角 ✖；点 ✖ 返回 true）
+    if raygui.window(bx, by, bw, bh, "背包 Backpack") then
+        bag_open = false
+    end
+
+    -- 物品格子：5 列 × 4 行
+    local cols, rows = 5, 4
+    local ss, gap = 64, 10
+    local gx, gy = bx + 16, by + 44
+    for i = 0, cols * rows - 1 do
+        local cx = gx + (i % cols) * (ss + gap)
+        local cy = gy + (i // cols) * (ss + gap)
+        -- 空文字按钮当格子，点击即选中
+        if raygui.button(cx, cy, ss, ss, "") then
+            bag_selected = i
+        end
+        local it = bag_items[i + 1]
+        if it then
+            draw_emoji(it.emoji, cx + 12, cy + 4, 40)                 -- 物品图标
+            raygui.label(cx + 6, cy + 44, ss - 12, 18, "x" .. it.count)  -- 数量
+            if bag_selected == i then
+                raygui.draw_icon(112, cx + ss - 20, cy + 2, 1, 40, 200, 80, 255)  -- ✓ 选中
+            end
+        end
+    end
+
+    -- 右侧详情栏
+    local dx = bx + cols * (ss + gap) + 24
+    local dy = by + 44
+    raygui.label(dx, dy, 140, 24, "—— 详情 ——")
+    local sel = bag_selected and bag_items[bag_selected + 1]
+    if sel then
+        draw_emoji(sel.emoji, dx + 28, dy + 36, 64)
+        raygui.label(dx, dy + 112, 140, 24, "名称: " .. sel.name)
+        raygui.label(dx, dy + 140, 140, 24, "数量: " .. sel.count)
+        if raygui.button(dx, dy + 176, 110, 34, "使用 x1") then
+            sel.count = sel.count - 1
+            if sel.count <= 0 then
+                table.remove(bag_items, bag_selected + 1)
+                bag_selected = nil
+            end
+        end
+    else
+        raygui.label(dx, dy + 40, 140, 24, "点格子选择物品")
+    end
+
+    raygui.label(bx + 16, by + bh - 30, bw - 32, 22,
+        "点格子选中物品，右侧可“使用”；点右上角 ✖ 关闭背包")
+end
+
 
 -- 主循环
 while not raygui.should_close() do
@@ -114,8 +191,8 @@ while not raygui.should_close() do
     -- 背景面板
     raygui.panel(0, 0, 910, 870, "")
 
-    -- dropdown 展开 / 对话框弹出时锁定其它控件（避免点击穿透），最后再置顶绘制它们
-    if dropdown_open or confirm_open then raygui.lock() end
+    -- dropdown 展开 / 对话框 / 背包弹出时锁定其它控件（避免点击穿透），最后再置顶绘制它们
+    if dropdown_open or confirm_open or bag_open then raygui.lock() end
 
     -- ============ 第一行 · 左：基础控件 ============
     raygui.group(15, 15, 430, 240, "基础控件 Basic")
@@ -171,8 +248,11 @@ while not raygui.should_close() do
     -- 彩色 emoji + 文字 组合按钮：emoji 贴图(名字 "open" 📂) 在左，文字在右
     if emoji_button(672, 364, 180, 40, "open", "打开 2") then print("打开 2 被点击") end
 
-    raygui.label(478, 452, 90, 24, "Mouse:")
-    raygui.label(575, 452, 300, 24, raygui.is_mouse_over_ui() and "悬停在 UI 上" or "未悬停")
+    raygui.label(478, 448, 90, 24, "Mouse:")
+    raygui.label(575, 448, 300, 24, raygui.is_mouse_over_ui() and "悬停在 UI 上" or "未悬停")
+
+    -- 打开背包：弹出"游戏物品栏"窗口（实现见循环末尾 draw_backpack）
+    if emoji_button(478, 480, 200, 34, "package", "打开背包") then bag_open = true end
 
     -- ============ 第三行：图标 #iconID# + 单色符号 emoji ============
     raygui.group(15, 535, 880, 160, "图标 #iconID# / 单色符号 emoji")
@@ -221,16 +301,22 @@ while not raygui.should_close() do
         end
     end
 
-    -- ============ 置顶层：dropdown 与 对话框（最后绘制，正确 z 序）============
-    raygui.unlock()
+    -- ============ 置顶层：dropdown / 背包 / 对话框（最后绘制，正确 z 序）============
+    -- 分两层：dropdown 在中间层；背包/对话框是更高的模态层。
+    local modal = confirm_open or bag_open
+    if not modal then raygui.unlock() end   -- 无模态时解锁，dropdown 可正常交互
 
-    -- dropdown 放最后画，展开列表盖在最上层
+    -- dropdown 放最后画，展开列表盖在主控件之上
     dropdown_selected, dropdown_open = raygui.dropdown(
         235, 334, 195, 38,
         "Option 1;Option 2;Option 3;Option 4", dropdown_selected, dropdown_open)
 
-    -- 模态确认对话框：点 #iconID# “删除”弹出。
-    -- messagebox 返回：-1=未点(继续显示)，0=✖，1=取消，2=确定
+    if modal then raygui.unlock() end       -- 解锁，让模态窗口本身可交互
+
+    -- 游戏背包窗口（模态，盖在最上层）
+    if bag_open then draw_backpack() end
+
+    -- 模态确认对话框：点 #iconID# “删除”弹出。-1=未点 0=✖ 1=取消 2=确定
     if confirm_open then
         local res = raygui.messagebox(295, 360, 320, 156,
             "确认删除", "确定要删除吗？\n此操作不可撤销。", "取消;确定")
