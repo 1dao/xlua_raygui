@@ -125,7 +125,9 @@ while not raygui.should_close() do
     end
     raygui.label(160, 60, 250, 28, "Clicked: " .. button_clicked .. " times")
 
-    checkbox_checked = raygui.checkbox(35, 112, 24, 24, "Toggle Me", checkbox_checked)
+    -- 复选框文字单独用 label 画（避免左对齐时 raygui 把复选框文字甩到框左边、跑出界）
+    checkbox_checked = raygui.checkbox(35, 112, 24, 24, "", checkbox_checked)
+    raygui.label(70, 113, 120, 28, "Toggle Me")
     raygui.label(235, 112, 200, 28, "状态: " .. (checkbox_checked and "ON" or "OFF"))
 
     raygui.label(35, 158, 70, 28, "Slider")
@@ -187,7 +189,9 @@ while not raygui.should_close() do
     -- 第二行：设置按钮 + 图标标签 + 带图标的复选框
     raygui.button(35, 614, 120, 36, "#141# 设置")
     raygui.label(165, 618, 230, 28, "#186# 你好 RayGUI!")          -- ♥ + 文字
-    show_password = raygui.checkbox(405, 616, 24, 24, "#44# 显示密码", show_password)
+    -- 复选框文字单独用 label 画（label 同样支持 #iconID#，眼睛图标随之渲染）
+    show_password = raygui.checkbox(405, 616, 24, 24, "", show_password)
+    raygui.label(437, 618, 180, 28, "#44# 显示密码")
     raygui.set_icon_scale(1)
 
     -- 字体自带的单色符号 emoji（raylib 文字引擎只画单色轮廓，忽略彩色表）
