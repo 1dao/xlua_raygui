@@ -380,6 +380,90 @@ static int l_is_locked(lua_State *L) {
 }
 
 //============================================================================
+// 3D 模型视图：把一个旋转的 3D 模型渲染到离屏纹理，再贴到面板的指定矩形内。
+// 这样 3D 场景就能像普通控件一样嵌在 raygui 界面里。
+//============================================================================
+static RenderTexture2D g_model_rt = {0};
+static int   g_model_rt_w = 0, g_model_rt_h = 0;
+static Model g_model = {0};
+static Texture2D g_model_tex = {0};
+static bool  g_model_ready = false;
+
+static void model_view_init(void) {
+    if (g_model_ready) return;
+    // 棋盘格纹理，贴到立方体上当作"模型贴图"
+    Image chk = GenImageChecked(64, 64, 8, 8,
+                                (Color){235, 235, 235, 255}, (Color){90, 140, 230, 255});
+    g_model_tex = LoadTextureFromImage(chk);
+    UnloadImage(chk);
+    // 生成一个立方体网格模型，并把贴图挂到漫反射通道
+    g_model = LoadModelFromMesh(GenMeshCube(2.0f, 2.0f, 2.0f));
+    g_model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = g_model_tex;
+    g_model_ready = true;
+}
+
+static void model_view_free(void) {
+    if (!g_model_ready) return;
+    UnloadModel(g_model);                 // 注意：会顺带卸载材质，但贴图是我们自己建的，单独卸
+    UnloadTexture(g_model_tex);
+    if (g_model_rt.id != 0) UnloadRenderTexture(g_model_rt);
+    g_model_rt = (RenderTexture2D){0};
+    g_model = (Model){0};
+    g_model_tex = (Texture2D){0};
+    g_model_rt_w = g_model_rt_h = 0;
+    g_model_ready = false;
+}
+
+// model_view(x, y, w, h [, angle])
+//   在 (x,y,w,h) 区域内显示一个自动旋转的 3D 立方体模型 + 地面网格。
+//   不传 angle 则按时间自动旋转。
+static int l_model_view(lua_State *L) {
+    float x = (float)luaL_checknumber(L, 1);
+    float y = (float)luaL_checknumber(L, 2);
+    float w = (float)luaL_checknumber(L, 3);
+    float h = (float)luaL_checknumber(L, 4);
+    float angle = (float)luaL_optnumber(L, 5, GetTime() * 35.0);
+    int iw = (int)w, ih = (int)h;
+    if (iw < 1) iw = 1;
+    if (ih < 1) ih = 1;
+
+    model_view_init();
+
+    // 离屏纹理尺寸跟随面板大小；变化时重建
+    if (g_model_rt.id == 0 || g_model_rt_w != iw || g_model_rt_h != ih) {
+        if (g_model_rt.id != 0) UnloadRenderTexture(g_model_rt);
+        g_model_rt = LoadRenderTexture(iw, ih);
+        g_model_rt_w = iw;
+        g_model_rt_h = ih;
+    }
+
+    Camera3D cam = {0};
+    cam.position   = (Vector3){ 5.0f, 4.0f, 5.0f };
+    cam.target     = (Vector3){ 0.0f, 0.6f, 0.0f };
+    cam.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
+    cam.fovy       = 45.0f;
+    cam.projection = CAMERA_PERSPECTIVE;
+
+    // 1) 把 3D 场景渲染到离屏纹理
+    BeginTextureMode(g_model_rt);
+        ClearBackground((Color){30, 32, 38, 255});
+        BeginMode3D(cam);
+            DrawGrid(10, 1.0f);
+            DrawModelEx(g_model, (Vector3){0, 1, 0}, (Vector3){0, 1, 0}, angle,
+                        (Vector3){1, 1, 1}, WHITE);
+            DrawModelWiresEx(g_model, (Vector3){0, 1, 0}, (Vector3){0, 1, 0}, angle,
+                             (Vector3){1, 1, 1}, (Color){0, 0, 0, 60});
+        EndMode3D();
+    EndTextureMode();
+
+    // 2) 把离屏纹理贴回面板矩形（RenderTexture 的 y 是翻转的，源高取负）
+    Rectangle src = { 0.0f, 0.0f, (float)iw, -(float)ih };
+    Rectangle dst = { x, y, w, h };
+    DrawTexturePro(g_model_rt.texture, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
+    return 0;
+}
+
+//============================================================================
 // 窗口渲染
 //============================================================================
 static int l_init(lua_State *L) {
@@ -399,6 +483,7 @@ static int l_close(lua_State *L) {
     (void)L;
     font_reset();
     texture_free_all();
+    model_view_free();
     CloseWindow();
     return 0;
 }
@@ -1029,6 +1114,90 @@ static int l_load_font(lua_State *L)
 }
 
 //============================================================================
+// 渲染原语（xagent 等需要自绘文本/滚动区域的应用使用）
+//============================================================================
+static Color rg_color_opt(lua_State *L, int idx) {
+    Color c;
+    c.r = (unsigned char)luaL_optinteger(L, idx,     255);
+    c.g = (unsigned char)luaL_optinteger(L, idx + 1, 255);
+    c.b = (unsigned char)luaL_optinteger(L, idx + 2, 255);
+    c.a = (unsigned char)luaL_optinteger(L, idx + 3, 255);
+    return c;
+}
+
+// measure_text(text [, size]) -> width, height
+static int l_measure_text(lua_State *L) {
+    const char *text = luaL_checkstring(L, 1);
+    float size = (float)luaL_optnumber(L, 2, (lua_Number)GuiGetStyle(DEFAULT, TEXT_SIZE));
+    float spacing = (float)GuiGetStyle(DEFAULT, TEXT_SPACING);
+    font_ensure_text(text);
+    Vector2 sz = MeasureTextEx(GuiGetFont(), text, size, spacing);
+    lua_pushnumber(L, sz.x);
+    lua_pushnumber(L, sz.y);
+    return 2;
+}
+
+// draw_text(text, x, y [, size [, r, g, b, a]])
+static int l_draw_text(lua_State *L) {
+    const char *text = luaL_checkstring(L, 1);
+    float x = (float)luaL_checknumber(L, 2);
+    float y = (float)luaL_checknumber(L, 3);
+    float size = (float)luaL_optnumber(L, 4, (lua_Number)GuiGetStyle(DEFAULT, TEXT_SIZE));
+    Color c = rg_color_opt(L, 5);
+    float spacing = (float)GuiGetStyle(DEFAULT, TEXT_SPACING);
+    font_ensure_text(text);
+    DrawTextEx(GuiGetFont(), text, (Vector2){ x, y }, size, spacing, c);
+    return 0;
+}
+
+// draw_rectangle(x, y, w, h [, r, g, b, a])
+static int l_draw_rectangle(lua_State *L) {
+    int x = (int)luaL_checknumber(L, 1);
+    int y = (int)luaL_checknumber(L, 2);
+    int w = (int)luaL_checknumber(L, 3);
+    int h = (int)luaL_checknumber(L, 4);
+    DrawRectangle(x, y, w, h, rg_color_opt(L, 5));
+    return 0;
+}
+
+// begin_scissor(x, y, w, h) / end_scissor() — clip drawing to a rectangle.
+static int l_begin_scissor(lua_State *L) {
+    BeginScissorMode((int)luaL_checknumber(L, 1), (int)luaL_checknumber(L, 2),
+                     (int)luaL_checknumber(L, 3), (int)luaL_checknumber(L, 4));
+    return 0;
+}
+static int l_end_scissor(lua_State *L) { (void)L; EndScissorMode(); return 0; }
+
+// get_wheel() -> dy   (mouse wheel delta this frame)
+static int l_get_wheel(lua_State *L) { lua_pushnumber(L, GetMouseWheelMove()); return 1; }
+
+// get_mouse() -> x, y
+static int l_get_mouse(lua_State *L) {
+    Vector2 m = GetMousePosition();
+    lua_pushnumber(L, m.x);
+    lua_pushnumber(L, m.y);
+    return 2;
+}
+
+// screen_size() -> w, h
+static int l_screen_size(lua_State *L) {
+    lua_pushinteger(L, GetScreenWidth());
+    lua_pushinteger(L, GetScreenHeight());
+    return 2;
+}
+
+// set_clipboard(text) / get_clipboard() -> text
+static int l_set_clipboard(lua_State *L) {
+    SetClipboardText(luaL_checkstring(L, 1));
+    return 0;
+}
+static int l_get_clipboard(lua_State *L) {
+    const char *s = GetClipboardText();
+    lua_pushstring(L, s ? s : "");
+    return 1;
+}
+
+//============================================================================
 // 注册
 //============================================================================
 static const luaL_Reg raygui_lib[] = {
@@ -1063,6 +1232,17 @@ static const luaL_Reg raygui_lib[] = {
     {"lock",            l_lock},
     {"unlock",          l_unlock},
     {"is_locked",       l_is_locked},
+    {"model_view",      l_model_view},
+    {"measure_text",    l_measure_text},
+    {"draw_text",       l_draw_text},
+    {"draw_rectangle",  l_draw_rectangle},
+    {"begin_scissor",   l_begin_scissor},
+    {"end_scissor",     l_end_scissor},
+    {"get_wheel",       l_get_wheel},
+    {"get_mouse",       l_get_mouse},
+    {"screen_size",     l_screen_size},
+    {"set_clipboard",   l_set_clipboard},
+    {"get_clipboard",   l_get_clipboard},
     {NULL, NULL}
 };
 

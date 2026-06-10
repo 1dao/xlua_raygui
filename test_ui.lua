@@ -50,6 +50,7 @@ local confirm_result = ""         -- 上次对话框的选择结果（用于显�
 -- 背包（游戏物品栏）状态：用 emoji 当物品图标
 local bag_open = false
 local bag_selected = nil          -- 选中的格子序号（0 起）
+local view3d_open = false         -- 3D 模型窗口是否弹出
 local bag_items = {
     {emoji="gem",    name="宝石",   count=12},
     {emoji="key",    name="钥匙",   count=3},
@@ -183,6 +184,19 @@ local function draw_backpack()
         "点格子选中物品，右侧可“使用”；点右上角 ✖ 关闭背包")
 end
 
+-- 3D 模型窗口（模态）：把自动旋转的 3D 立方体模型渲染进窗口内部
+local function draw_model3d()
+    local w, h = 560, 420
+    local x, y = (910 - w) // 2, (870 - h) // 2   -- 居中
+    if raygui.window(x, y, w, h, "3D 模型 Model") then
+        view3d_open = false
+    end
+    -- 3D 视图填充窗口内部（避开标题栏与底部说明）
+    raygui.model_view(x + 12, y + 36, w - 24, h - 84)
+    raygui.label(x + 12, y + h - 38, w - 24, 24,
+        "自动旋转的立方体模型 + 地面网格；点右上角 ✖ 关闭")
+end
+
 
 -- 主循环
 while not raygui.should_close() do
@@ -192,7 +206,7 @@ while not raygui.should_close() do
     raygui.panel(0, 0, 910, 870, "")
 
     -- dropdown 展开 / 对话框 / 背包弹出时锁定其它控件（避免点击穿透），最后再置顶绘制它们
-    if dropdown_open or confirm_open or bag_open then raygui.lock() end
+    if dropdown_open or confirm_open or bag_open or view3d_open then raygui.lock() end
 
     -- ============ 第一行 · 左：基础控件 ============
     raygui.group(15, 15, 430, 240, "基础控件 Basic")
@@ -251,8 +265,9 @@ while not raygui.should_close() do
     raygui.label(478, 448, 90, 24, "Mouse:")
     raygui.label(575, 448, 300, 24, raygui.is_mouse_over_ui() and "悬停在 UI 上" or "未悬停")
 
-    -- 打开背包：弹出"游戏物品栏"窗口（实现见循环末尾 draw_backpack）
-    if emoji_button(478, 480, 200, 34, "package", "打开背包") then bag_open = true end
+    -- 打开背包 / 打开 3D 模型：弹出对应的模态窗口（实现见循环末尾）
+    if emoji_button(478, 480, 165, 34, "package", "打开背包") then bag_open = true end
+    if raygui.button(653, 480, 130, 34, "#162# 3D 模型") then view3d_open = true end  -- #162#=ICON_CUBE
 
     -- ============ 第三行：图标 #iconID# + 单色符号 emoji ============
     raygui.group(15, 535, 880, 160, "图标 #iconID# / 单色符号 emoji")
@@ -303,7 +318,7 @@ while not raygui.should_close() do
 
     -- ============ 置顶层：dropdown / 背包 / 对话框（最后绘制，正确 z 序）============
     -- 分两层：dropdown 在中间层；背包/对话框是更高的模态层。
-    local modal = confirm_open or bag_open
+    local modal = confirm_open or bag_open or view3d_open
     if not modal then raygui.unlock() end   -- 无模态时解锁，dropdown 可正常交互
 
     -- dropdown 放最后画，展开列表盖在主控件之上
@@ -315,6 +330,7 @@ while not raygui.should_close() do
 
     -- 游戏背包窗口（模态，盖在最上层）
     if bag_open then draw_backpack() end
+    if view3d_open then draw_model3d() end
 
     -- 模态确认对话框：点 #iconID# “删除”弹出。-1=未点 0=✖ 1=取消 2=确定
     if confirm_open then
