@@ -19,12 +19,51 @@
 #include "../raylib/src/raylib.h"
 #include "../raygui/src/raygui.h"
 
+// raygui 官方示例的应用内文件/目录选择对话框（拷贝自
+// ../raygui/examples/custom_file_dialog/，include 路径已修）。
+// 立即模式浮窗：file_dialog_open() 打开，每帧 file_dialog() 绘制并取状态。
+#define GUI_WINDOW_FILE_DIALOG_IMPLEMENTATION
+#include "gui_window_file_dialog.h"
+
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "lua.h"
 #include "lualib.h"
 #include "lauxlib.h"
+// dll 压缩 upx --best --lzma raygui.dll
+
+// 剪贴板探测：剪贴板里是图片等非文本时，GLFW 的 GetClipboardText 会失败并刷
+// "Failed to convert clipboard to string" WARNING。粘贴前先用 Win32 探一下有无
+// 文本格式，没有就静默跳过。windows.h 与 raylib 符号冲突（Rectangle/CloseWindow/
+// DrawText…），故手工声明所需函数（user32/kernel32，MinGW 默认链接）。
+#if defined(_WIN32)
+__declspec(dllimport) int __stdcall IsClipboardFormatAvailable(unsigned int format);
+__declspec(dllimport) int __stdcall OpenClipboard(void *hWndNewOwner);
+__declspec(dllimport) int __stdcall CloseClipboard(void);
+__declspec(dllimport) void * __stdcall GetClipboardData(unsigned int uFormat);
+__declspec(dllimport) void * __stdcall GlobalLock(void *hMem);
+__declspec(dllimport) int __stdcall GlobalUnlock(void *hMem);
+__declspec(dllimport) size_t __stdcall GlobalSize(void *hMem);
+#define WIN32_CF_TEXT        1
+#define WIN32_CF_DIB         8
+#define WIN32_CF_UNICODETEXT 13
+static int clipboard_has_text(void) {
+    return IsClipboardFormatAvailable(WIN32_CF_UNICODETEXT)
+        || IsClipboardFormatAvailable(WIN32_CF_TEXT);
+}
+static int clipboard_has_image(void) {
+    return IsClipboardFormatAvailable(WIN32_CF_DIB);
+}
+#else
+static int clipboard_has_text(void) { return 1; }
+static int clipboard_has_image(void) { return 0; }
+#endif
+
+// textbox_multi 编辑态里按 Ctrl+V 而剪贴板是图片（无文本）时置位；
+// Lua 侧每帧用 take_pasted_image() 轮询取走（取走即清零）。
+static int g_image_pasted = 0;
 
 #define TEXT_BUF_SINGLE  4096
 #define TEXT_BUF_MULTI   16384
@@ -313,6 +352,142 @@ static int l_draw_texture_ex(lua_State *L) {
     return 0;
 }
 
+//============================================================================
+// 剪贴板图片：CF_DIB → RGBA → （必要时缩小）→ PNG 内存编码
+//============================================================================
+#if defined(_WIN32)
+// 支持 24/32bpp 未压缩 DIB（BI_RGB / 标准掩码 BI_BITFIELDS，覆盖截图工具、
+// 浏览器复制、QQ/微信等主流来源）；其余格式返回 NULL。长边超过 1568 像素时
+// 等比缩小（Anthropic 推荐的图片上限，顺便压住 PNG/base64 体积）。
+// 返回 RL_MALLOC 的 PNG 缓冲（调用方 MemFree），尺寸经 out_size/out_w/out_h。
+static unsigned char *grab_clipboard_image_png(int *out_size, int *out_w, int *out_h) {
+    *out_size = 0;
+    if (!clipboard_has_image() || !OpenClipboard(NULL)) return NULL;
+
+    unsigned char *png = NULL;
+    void *hmem = GetClipboardData(WIN32_CF_DIB);
+    unsigned char *p = hmem ? (unsigned char *)GlobalLock(hmem) : NULL;
+    if (p) {
+        size_t   total = GlobalSize(hmem);
+        uint32_t hsz, comp;
+        int32_t  w, hgt;
+        uint16_t bpp;
+        memcpy(&hsz,  p + 0,  4);          // BITMAPINFOHEADER（或 V4/V5）字段
+        memcpy(&w,    p + 4,  4);
+        memcpy(&hgt,  p + 8,  4);
+        memcpy(&bpp,  p + 14, 2);
+        memcpy(&comp, p + 16, 4);
+        int top_down = hgt < 0;
+        int height   = top_down ? -hgt : hgt;
+        // 像素区偏移：头 + （仅 40 字节头的 BI_BITFIELDS 带 3 个掩码 DWORD）
+        size_t off = (size_t)hsz + ((comp == 3 && hsz == 40) ? 12 : 0);
+
+        if (total > 20 && hsz >= 40 && w > 0 && height > 0 && w < 32768 && height < 32768
+            && (bpp == 24 || bpp == 32) && (comp == 0 || comp == 3)) {
+            size_t stride = ((size_t)w * (bpp / 8) + 3) & ~(size_t)3;
+            if (off + stride * (size_t)height <= total) {
+                unsigned char *rgba = (unsigned char *)malloc((size_t)w * height * 4);
+                if (rgba) {
+                    int alpha_all_zero = 1;
+                    for (int y = 0; y < height; y++) {
+                        const unsigned char *row = p + off
+                            + stride * (size_t)(top_down ? y : (height - 1 - y));
+                        unsigned char *dst = rgba + (size_t)y * w * 4;
+                        if (bpp == 32) {
+                            for (int x = 0; x < w; x++) {       // BGRA → RGBA
+                                dst[x*4+0] = row[x*4+2];
+                                dst[x*4+1] = row[x*4+1];
+                                dst[x*4+2] = row[x*4+0];
+                                dst[x*4+3] = row[x*4+3];
+                                if (row[x*4+3]) alpha_all_zero = 0;
+                            }
+                        } else {
+                            for (int x = 0; x < w; x++) {       // BGR → RGBA
+                                dst[x*4+0] = row[x*3+2];
+                                dst[x*4+1] = row[x*3+1];
+                                dst[x*4+2] = row[x*3+0];
+                                dst[x*4+3] = 255;
+                            }
+                            alpha_all_zero = 0;
+                        }
+                    }
+                    // 32bpp 常见坑：不少来源 alpha 通道全 0 表示“无 alpha”，
+                    // 直接用会得到全透明图 → 按不透明处理。
+                    if (alpha_all_zero) {
+                        for (size_t i = 3; i < (size_t)w * height * 4; i += 4) rgba[i] = 255;
+                    }
+
+                    // 注意：rgba 用 malloc 分配，后续 ImageResize/UnloadImage 用
+                    // RL_FREE 释放它 —— 仅在默认配置（RL_FREE==free）下成立。
+                    Image img = { rgba, w, height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+                    int maxdim = (w > height) ? w : height;
+                    if (maxdim > 1568) {
+                        float k = 1568.0f / (float)maxdim;
+                        ImageResize(&img, (int)(w * k), (int)(height * k));
+                    }
+                    int fsz = 0;
+                    unsigned char *mem = ExportImageToMemory(img, ".png", &fsz);
+                    UnloadImage(img);          // 释放（可能已被 resize 替换的）像素
+                    if (mem && fsz > 0) {
+                        png = mem; *out_size = fsz; *out_w = img.width; *out_h = img.height;
+                    } else if (mem) {
+                        MemFree(mem);
+                    }
+                }
+            }
+        }
+        GlobalUnlock(hmem);
+    }
+    CloseClipboard();
+    return png;
+}
+#else
+static unsigned char *grab_clipboard_image_png(int *out_size, int *out_w, int *out_h) {
+    (void)out_w; (void)out_h; *out_size = 0; return NULL;
+}
+#endif
+
+// get_clipboard_image() -> png_bytes, w, h | nil  （剪贴板位图编码为 PNG）
+static int l_get_clipboard_image(lua_State *L) {
+    int size = 0, w = 0, h = 0;
+    unsigned char *png = grab_clipboard_image_png(&size, &w, &h);
+    if (!png) { lua_pushnil(L); return 1; }
+    lua_pushlstring(L, (const char *)png, (size_t)size);
+    lua_pushinteger(L, w);
+    lua_pushinteger(L, h);
+    MemFree(png);
+    return 3;
+}
+
+// take_pasted_image() -> png_bytes, w, h | nil
+// 输入框 Ctrl+V 粘贴图片的取走式轮询（无粘贴时返回 nil，开销仅一次旗标判断）。
+static int l_take_pasted_image(lua_State *L) {
+    if (!g_image_pasted) { lua_pushnil(L); return 1; }
+    g_image_pasted = 0;
+    return l_get_clipboard_image(L);
+}
+
+// load_texture_mem(png_bytes) -> id, w, h | nil, err  （内存 PNG → 纹理，缩略图用）
+static int l_load_texture_mem(lua_State *L) {
+    size_t n = 0;
+    const char *data = luaL_checklstring(L, 1, &n);
+    Image img = LoadImageFromMemory(".png", (const unsigned char *)data, (int)n);
+    if (!img.data) { lua_pushnil(L); lua_pushstring(L, "decode failed"); return 2; }
+    Texture tex = LoadTextureFromImage(img);
+    UnloadImage(img);
+    if (tex.id == 0) { lua_pushnil(L); lua_pushstring(L, "texture upload failed"); return 2; }
+    int id = texture_alloc(tex);
+    if (id == 0) {
+        UnloadTexture(tex);
+        lua_pushnil(L); lua_pushstring(L, "texture limit reached");
+        return 2;
+    }
+    lua_pushinteger(L, id);
+    lua_pushinteger(L, tex.width);
+    lua_pushinteger(L, tex.height);
+    return 3;
+}
+
 static int l_draw_icon(lua_State *L) {
     int iconId  = (int)luaL_checkinteger(L, 1);
     int posX    = (int)luaL_checkinteger(L, 2);
@@ -502,8 +677,8 @@ static int l_begin(lua_State *L) {
     g_mouse_over_ui_current = false;
     
     BeginDrawing();
-    ClearBackground((Color){24, 24, 24, 255});
-    
+    ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));  // follow the active theme
+
     return 0;
 }
 
@@ -578,6 +753,7 @@ static int l_progressbar(lua_State *L) {
 static int g_cursor_single = 0;
 static int g_cursor_multi  = 0;
 static int g_scroll_multi  = 0;   // 多行框纵向滚动（以"行"为单位）
+static int g_sel_anchor    = -1;  // 多行框选区锚点（-1=无选区；否则与光标构成选区）
 
 // 首次按下 + 长按时的系统级自动重复（退格/删除/方向键长按可连续触发）
 static bool key_repeat(int key) {
@@ -732,35 +908,135 @@ static int l_textbox(lua_State *L) {
 //============================================================================
 // 基础控件 - 多行输入框（双返回值，全接管，支持完整的上下左右方向键跨行跳转）
 //============================================================================
+// ── 多行框选区辅助 ──────────────────────────────────────────────────────────
+static void tbm_sel_range(int *a, int *b) {
+    int c = g_cursor_multi, s = g_sel_anchor;
+    if (s < 0 || s == c) { *a = c; *b = c; return; }
+    if (s < c) { *a = s; *b = c; } else { *a = c; *b = s; }
+}
+static bool tbm_has_sel(void) { int a, b; tbm_sel_range(&a, &b); return a != b; }
+static void tbm_del_sel(int *len) {
+    int a, b; tbm_sel_range(&a, &b);
+    if (a == b) return;
+    memmove(g_buf_multi + a, g_buf_multi + b, *len - b + 1);
+    *len -= (b - a);
+    g_cursor_multi = a;
+    g_sel_anchor = -1;
+}
+// 把鼠标位置映射成 g_buf_multi 中的字节偏移（按 \n 分行 + 纵向滚动 + 逐字测宽）
+static int tbm_pos_from_mouse(Rectangle r, float fontSize, float spacing, float padding, float lineH, int len) {
+    Font font = GuiGetFont();
+    Vector2 m = GetMousePosition();
+    int target = g_scroll_multi + (int)((m.y - (r.y + padding)) / lineH);
+    if (target < 0) target = 0;
+
+    int line = 0, ls = 0, i = 0;
+    for (; i <= len; i++) {
+        if (i == len || g_buf_multi[i] == '\n') {
+            if (line == target) break;
+            line++; ls = i + 1;
+        }
+    }
+    int le = i;                       // 行末（\n 或 len）
+    if (line < target) ls = le;       // 点在最后一行之下
+
+    float relx = m.x - (r.x + padding);
+    if (relx <= 0) return ls;
+
+    char tmp[TEXT_BUF_MULTI];
+    int j = ls;
+    while (j < le) {
+        int nj = j + 1;
+        while (nj < le && (g_buf_multi[nj] & 0xC0) == 0x80) nj++;   // 跨完整 UTF-8 字符
+        int sub = nj - ls;
+        memcpy(tmp, g_buf_multi + ls, sub); tmp[sub] = '\0';
+        float w = MeasureTextEx(font, tmp, fontSize, spacing).x;
+        if (w > relx) {
+            int subj = j - ls;
+            memcpy(tmp, g_buf_multi + ls, subj); tmp[subj] = '\0';
+            float pw = MeasureTextEx(font, tmp, fontSize, spacing).x;
+            return (relx < (pw + w) / 2.0f) ? j : nj;   // 取更近的字符边界
+        }
+        j = nj;
+    }
+    return le;
+}
+
 static int l_textbox_multi(lua_State *L) {
     Rectangle r = {lua_tonumber(L,1), lua_tonumber(L,2), lua_tonumber(L,3), lua_tonumber(L,4)};
     const char *text_from_lua = luaL_checkstring(L, 5);
     bool editMode = lua_toboolean(L, 6);
+    bool enter_submits = lua_toboolean(L, 7);   // optional: Enter=submit, Ctrl+Enter=newline
+    bool submitted = false;
 
     strncpy(g_buf_multi, text_from_lua, TEXT_BUF_MULTI-1);
     g_buf_multi[TEXT_BUF_MULTI - 1] = '\0';
     int len = strlen(g_buf_multi);
 
-    // 1. 鼠标点击判定
+    // 字体度量（鼠标定位与渲染共用）
+    float fontSize = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
+    float spacing  = (float)GuiGetStyle(DEFAULT, TEXT_SPACING);
+    float padding  = (float)GuiGetStyle(DEFAULT, TEXT_PADDING);
+    float lineH    = fontSize + 4.0f;
+
+    // 1. 鼠标：点击定位光标并起选区；按住拖拽扩展选区
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
         if (CheckCollisionPointRec(GetMousePosition(), r)) {
-            if (!editMode) {
-                editMode = true;
-                g_cursor_multi = len; // 首次聚焦，将光标放最末尾
-            }
+            editMode = true;
+            g_cursor_multi = tbm_pos_from_mouse(r, fontSize, spacing, padding, lineH, len);
+            g_sel_anchor = g_cursor_multi;
         } else {
             editMode = false;
+            g_sel_anchor = -1;
         }
+    } else if (editMode && IsMouseButtonDown(MOUSE_LEFT_BUTTON)
+               && CheckCollisionPointRec(GetMousePosition(), r)) {
+        g_cursor_multi = tbm_pos_from_mouse(r, fontSize, spacing, padding, lineH, len);  // 拖拽：锚点不动，选区扩展
     }
 
     if (g_cursor_multi > len) g_cursor_multi = len;
     if (g_cursor_multi < 0) g_cursor_multi = 0;
+    if (g_sel_anchor > len) g_sel_anchor = len;
 
     // 2. 键盘流控制及完整的上下左右核心处理机制
     if (editMode) {
+        bool shift = IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_SHIFT);
+        bool ctrl  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+
+        // 快捷键：Ctrl+A 全选 / Ctrl+C 复制 / Ctrl+X 剪切 / Ctrl+V 粘贴
+        if (ctrl) {
+            if (IsKeyPressed(KEY_A)) { g_sel_anchor = 0; g_cursor_multi = len; }
+            if (IsKeyPressed(KEY_C) || IsKeyPressed(KEY_X)) {
+                int a, b; tbm_sel_range(&a, &b);
+                if (a == b) { a = 0; b = len; }                 // 无选区 → 整段
+                char saved = g_buf_multi[b]; g_buf_multi[b] = '\0';
+                SetClipboardText(g_buf_multi + a);
+                g_buf_multi[b] = saved;
+                if (IsKeyPressed(KEY_X) && tbm_has_sel()) tbm_del_sel(&len);
+            }
+            if (IsKeyPressed(KEY_V)) {
+                if (clipboard_has_text()) {
+                    const char *clip = GetClipboardText();
+                    if (clip && clip[0]) {
+                        if (tbm_has_sel()) tbm_del_sel(&len);
+                        int cl = (int)strlen(clip);
+                        if (len + cl < TEXT_BUF_MULTI - 1) {
+                            memmove(g_buf_multi + g_cursor_multi + cl, g_buf_multi + g_cursor_multi, len - g_cursor_multi + 1);
+                            memcpy(g_buf_multi + g_cursor_multi, clip, cl);
+                            g_cursor_multi += cl; len += cl;
+                        }
+                    }
+                } else if (clipboard_has_image()) {
+                    g_image_pasted = 1;     // Lua 侧 take_pasted_image() 取走
+                }
+            }
+        }
+
         // A. 捕获常规打字及多汉字 IME 确认输入，中途插入到光标所在处
         int cp;
         while ((cp = GetCharPressed()) > 0) {
+            if (ctrl) continue;                     // Ctrl 组合不当字符输入
+            if (tbm_has_sel()) tbm_del_sel(&len);   // 有选区：先删除选区
             char utf8[5] = {0};
             int bytes = 0;
             if (cp < 0x80) { utf8[0] = cp; bytes = 1; }
@@ -778,6 +1054,7 @@ static int l_textbox_multi(lua_State *L) {
 
         // B. 处理左移键 (Arrow Left)
         if (key_repeat(KEY_LEFT)) {
+            if (shift) { if (g_sel_anchor < 0) g_sel_anchor = g_cursor_multi; } else g_sel_anchor = -1;
             if (g_cursor_multi > 0) {
                 int prev = g_cursor_multi - 1;
                 while (prev > 0 && (g_buf_multi[prev] & 0xC0) == 0x80) {
@@ -789,6 +1066,7 @@ static int l_textbox_multi(lua_State *L) {
 
         // C. 处理右移键 (Arrow Right)
         if (key_repeat(KEY_RIGHT)) {
+            if (shift) { if (g_sel_anchor < 0) g_sel_anchor = g_cursor_multi; } else g_sel_anchor = -1;
             if (g_cursor_multi < len) {
                 int next = g_cursor_multi + 1;
                 while (next < len && (g_buf_multi[next] & 0xC0) == 0x80) {
@@ -800,6 +1078,7 @@ static int l_textbox_multi(lua_State *L) {
 
         // D. 【新增核心】处理上移键 (Arrow Up) —— 高精确跨行往上迁移
         if (key_repeat(KEY_UP)) {
+            if (shift) { if (g_sel_anchor < 0) g_sel_anchor = g_cursor_multi; } else g_sel_anchor = -1;
             int line_start = g_cursor_multi;
             while (line_start > 0 && g_buf_multi[line_start - 1] != '\n') {
                 line_start--;
@@ -827,6 +1106,7 @@ static int l_textbox_multi(lua_State *L) {
 
         // E. 【新增核心】处理下移键 (Arrow Down) —— 高精确跨行往下迁移
         if (key_repeat(KEY_DOWN)) {
+            if (shift) { if (g_sel_anchor < 0) g_sel_anchor = g_cursor_multi; } else g_sel_anchor = -1;
             int line_start = g_cursor_multi;
             while (line_start > 0 && g_buf_multi[line_start - 1] != '\n') {
                 line_start--;
@@ -856,9 +1136,10 @@ static int l_textbox_multi(lua_State *L) {
             }
         }
 
-        // F. 处理退格键 (Backspace) 中途安全向前删除
+        // F. 处理退格键 (Backspace)：有选区先删选区，否则向前删一字
         if (key_repeat(KEY_BACKSPACE)) {
-            if (g_cursor_multi > 0) {
+            if (tbm_has_sel()) { tbm_del_sel(&len); }
+            else if (g_cursor_multi > 0) {
                 int prev = g_cursor_multi - 1;
                 while (prev > 0 && (g_buf_multi[prev] & 0xC0) == 0x80) {
                     prev--;
@@ -870,9 +1151,10 @@ static int l_textbox_multi(lua_State *L) {
             }
         }
 
-        // G. 处理删除键 (Delete) 中途安全向后删除
+        // G. 处理删除键 (Delete)：有选区先删选区，否则向后删一字
         if (key_repeat(KEY_DELETE)) {
-            if (g_cursor_multi < len) {
+            if (tbm_has_sel()) { tbm_del_sel(&len); }
+            else if (g_cursor_multi < len) {
                 int next = g_cursor_multi + 1;
                 while (next < len && (g_buf_multi[next] & 0xC0) == 0x80) {
                     next++;
@@ -883,9 +1165,14 @@ static int l_textbox_multi(lua_State *L) {
             }
         }
 
-        // H. 处理多行换行（按回车在任意光标处切开文本并添加 \n）
+        // H. 回车：enter_submits 时普通回车=提交（不插换行），Ctrl+回车=换行；
+        //    否则（默认）回车总是插入换行。
         if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
-            if (len < TEXT_BUF_MULTI - 2) {
+            bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+            if (enter_submits && !ctrl) {
+                submitted = true;   // caller sends; no newline inserted
+            } else if (len < TEXT_BUF_MULTI - 2) {
+                if (tbm_has_sel()) tbm_del_sel(&len);
                 memmove(g_buf_multi + g_cursor_multi + 1, g_buf_multi + g_cursor_multi, len - g_cursor_multi + 1);
                 g_buf_multi[g_cursor_multi] = '\n';
                 g_cursor_multi++;
@@ -898,11 +1185,7 @@ static int l_textbox_multi(lua_State *L) {
 
     // 3. 渲染：手动绘制文本（顶对齐 + 裁剪到框内 + 跟随光标纵向滚动），
     //    彻底避免内容过多时向上溢出、压到上方其它控件。
-    Font  font     = GuiGetFont();
-    float fontSize = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
-    float spacing  = (float)GuiGetStyle(DEFAULT, TEXT_SPACING);
-    float padding  = (float)GuiGetStyle(DEFAULT, TEXT_PADDING);
-    float lineH    = fontSize + 4.0f;
+    Font  font     = GuiGetFont();   // fontSize/spacing/padding/lineH 已在函数顶部声明
 
     // 先用 GuiTextBox（空串）画出原生边框与底色，文字我们自己画
     char empty[1] = {0};
@@ -940,6 +1223,22 @@ static int l_textbox_multi(lua_State *L) {
                     memcpy(tmp, g_buf_multi + ls, seg);
                     tmp[seg] = '\0';
                     float ty = r.y + padding + (line - g_scroll_multi) * lineH;
+                    // 选区高亮（落在本行内的部分）
+                    if (editMode) {
+                        int sa, sb; tbm_sel_range(&sa, &sb);
+                        int s0 = sa > ls ? sa : ls;
+                        int s1 = sb < i ? sb : i;
+                        if (s1 > s0) {
+                            char pre[TEXT_BUF_MULTI];
+                            int p0 = s0 - ls; memcpy(pre, g_buf_multi + ls, p0); pre[p0] = '\0';
+                            float x0 = MeasureTextEx(font, pre, fontSize, spacing).x;
+                            int p1 = s1 - ls; memcpy(pre, g_buf_multi + ls, p1); pre[p1] = '\0';
+                            float x1 = MeasureTextEx(font, pre, fontSize, spacing).x;
+                            Color hl = GetColor(GuiGetStyle(TEXTBOX, BORDER_COLOR_FOCUSED));
+                            hl.a = 90;
+                            DrawRectangle((int)(r.x + padding + x0), (int)ty, (int)(x1 - x0), (int)lineH, hl);
+                        }
+                    }
                     DrawTextEx(font, tmp, (Vector2){ r.x + padding, ty }, fontSize, spacing, textColor);
                 }
                 line++;
@@ -970,7 +1269,8 @@ static int l_textbox_multi(lua_State *L) {
 
     lua_pushstring(L, g_buf_multi);
     lua_pushboolean(L, editMode);
-    return 2;
+    lua_pushboolean(L, submitted);
+    return 3;
 }
 
 //============================================================================
@@ -989,6 +1289,37 @@ static int l_group(lua_State *L) {
     const char *text = luaL_checkstring(L,5);
     font_ensure_text(text);
     GuiGroupBox(r, text);
+
+    // Color line = GetColor(GuiGetStyle(DEFAULT, LINE_COLOR));
+    // Color bg = GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR));
+    // float thick = 1.0f;
+    // float textSize = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
+    // float spacing = (float)GuiGetStyle(DEFAULT, TEXT_SPACING);
+    // float margin = 12.0f;
+    // float padding = 6.0f;
+
+    // DrawRectangleRec((Rectangle){ r.x, r.y, thick, r.height }, line);
+    // DrawRectangleRec((Rectangle){ r.x, r.y + r.height - thick, r.width, thick }, line);
+    // DrawRectangleRec((Rectangle){ r.x + r.width - thick, r.y, thick, r.height }, line);
+
+    // if (text && text[0] != '\0') {
+    //     Vector2 textSizePx = MeasureTextEx(GuiGetFont(), text, textSize, spacing);
+    //     float textX = r.x + margin;
+    //     float textY = r.y - textSize * 0.5f;
+    //     float clearX = textX - padding;
+    //     float clearW = textSizePx.x + padding * 2.0f;
+    //     float leftW = clearX - r.x;
+    //     float rightX = clearX + clearW;
+    //     float rightW = r.x + r.width - rightX;
+
+    //     DrawRectangleRec((Rectangle){ clearX, textY, clearW, textSizePx.y }, bg);
+    //     if (leftW > 0.0f) DrawRectangleRec((Rectangle){ r.x, r.y, leftW, thick }, line);
+    //     if (rightW > 0.0f) DrawRectangleRec((Rectangle){ rightX, r.y, rightW, thick }, line);
+    //     DrawTextEx(GuiGetFont(), text, (Vector2){ textX, textY }, textSize, spacing, line);
+    // } else {
+    //     DrawRectangleRec((Rectangle){ r.x, r.y, r.width, thick }, line);
+    // }
+
     return 0;
 }
 
@@ -1186,13 +1517,68 @@ static int l_screen_size(lua_State *L) {
     return 2;
 }
 
+// get_style(control, property) -> int  (color props are 0xRRGGBBAA)
+static int l_get_style(lua_State *L) {
+    int control = (int)luaL_checkinteger(L, 1);
+    int property = (int)luaL_checkinteger(L, 2);
+    lua_pushinteger(L, (lua_Integer)(unsigned int)GuiGetStyle(control, property));
+    return 1;
+}
+
+//============================================================================
+// 应用内文件/目录选择对话框（gui_window_file_dialog 封装）
+//============================================================================
+static GuiWindowFileDialogState g_file_dialog;
+static int g_file_dialog_live = 0;
+
+// file_dialog_open(init_path?, w?, h?, dirs_only?) — 打开对话框（居中，默认
+// 560x420）。dirs_only=true 时只列目录：过滤串变成 "DIRS*;.__dironly__"，
+// 目录靠 DIRS 标签保留，文件因扩展名永不匹配而全部隐藏（选目录场景）。
+static int l_file_dialog_open(lua_State *L) {
+    const char *path = luaL_optstring(L, 1, NULL);
+    int w = (int)luaL_optinteger(L, 2, 560);
+    int h = (int)luaL_optinteger(L, 3, 420);
+    int dirs_only = lua_toboolean(L, 4);
+    g_file_dialog = InitGuiWindowFileDialog(path);
+    g_file_dialog.windowBounds = (Rectangle){
+        (float)(GetScreenWidth() / 2 - w / 2), (float)(GetScreenHeight() / 2 - h / 2),
+        (float)w, (float)h };
+    if (dirs_only) strcpy(g_file_dialog.filterExt, ".__dironly__");
+    g_file_dialog.windowActive = true;
+    g_file_dialog_live = 1;
+    return 0;
+}
+
+// file_dialog() -> 'active' | 'select', dir, file | 'cancel' | nil(未打开)
+// 每帧调用（在主界面之后，叠加绘制）。'select' 时 dir = 当前目录，file = 选中
+// 文件名（目录选择场景忽略 file、直接用 dir）。
+static int l_file_dialog(lua_State *L) {
+    if (!g_file_dialog_live) { lua_pushnil(L); return 1; }
+    GuiWindowFileDialog(&g_file_dialog);
+    if (g_file_dialog.SelectFilePressed) {
+        g_file_dialog.SelectFilePressed = false;
+        g_file_dialog_live = 0;
+        lua_pushstring(L, "select");
+        lua_pushstring(L, g_file_dialog.dirPathText);
+        lua_pushstring(L, g_file_dialog.fileNameText);
+        return 3;
+    }
+    if (!g_file_dialog.windowActive) {
+        g_file_dialog_live = 0;
+        lua_pushstring(L, "cancel");
+        return 1;
+    }
+    lua_pushstring(L, "active");
+    return 1;
+}
+
 // set_clipboard(text) / get_clipboard() -> text
 static int l_set_clipboard(lua_State *L) {
     SetClipboardText(luaL_checkstring(L, 1));
     return 0;
 }
 static int l_get_clipboard(lua_State *L) {
-    const char *s = GetClipboardText();
+    const char *s = clipboard_has_text() ? GetClipboardText() : NULL;
     lua_pushstring(L, s ? s : "");
     return 1;
 }
@@ -1223,7 +1609,12 @@ static const luaL_Reg raygui_lib[] = {
     {"set_style",       l_set_style},
     {"load_font",       l_load_font},
     {"load_texture",    l_load_texture},
+    {"load_texture_mem", l_load_texture_mem},
     {"unload_texture",  l_unload_texture},
+    {"get_clipboard_image", l_get_clipboard_image},
+    {"take_pasted_image",   l_take_pasted_image},
+    {"file_dialog_open",    l_file_dialog_open},
+    {"file_dialog",         l_file_dialog},
     {"draw_texture",    l_draw_texture},
     {"draw_texture_ex", l_draw_texture_ex},
     {"draw_icon",       l_draw_icon},
@@ -1243,6 +1634,7 @@ static const luaL_Reg raygui_lib[] = {
     {"screen_size",     l_screen_size},
     {"set_clipboard",   l_set_clipboard},
     {"get_clipboard",   l_get_clipboard},
+    {"get_style",       l_get_style},
     {NULL, NULL}
 };
 

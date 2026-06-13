@@ -18,13 +18,26 @@ raygui.init(910, 870, "RayGUI Lua Test")
 local font_path = script_dir() .. "/fonts/NotoSansSC-Regular.otf"
 assert(raygui.load_font(font_path, 20), "Font load failed...")
 
--- ===== 应用现代 UI 风格（6选1，不用的注释掉） =====
--- require("styles.dark").apply(raygui)   -- Dark: VS Code 风格深色
--- require("styles.cyber").apply(raygui)  -- Cyber: 赛博朋克霓虹
-require("styles.candy").apply(raygui)  -- Candy: 糖果暖色调
--- require("styles.nord").apply(raygui)   -- ★ Nord: 北极蓝灰 — 冷静高级
--- require("styles.soft").apply(raygui)   -- Soft: 清新柔光 — 现代干净
+-- ===== 应用现代 UI 风格（选1，不用的注释掉） =====
+local STYLES_DIR = script_dir() .. "/styles"
+dofile(STYLES_DIR .. "/candy.lua").apply(raygui)  -- Candy: 糖果暖色调
+-- dofile(STYLES_DIR .. "/dark.lua").apply(raygui)  -- Dark: VS Code 风格深色
+-- dofile(STYLES_DIR .. "/cyber.lua").apply(raygui) -- Cyber: 赛博朋克霓虹
 -- (不加载任何风格 = raygui 默认风格)
+
+-- 动态风格轮换函数（点 "设置" 按钮时触发）
+local style_cycle = 1       -- 风格轮换：1=Dark 2=Cyber 3=Candy
+local STYLE_NAMES = { "Dark", "Cyber", "Candy" }
+local function cycle_style()
+    style_cycle = (style_cycle % #STYLE_NAMES) + 1
+    local style = dofile(STYLES_DIR .. "/" .. STYLE_NAMES[style_cycle]:lower() .. ".lua")
+    style.apply(raygui)
+    -- 恢复字体设置（换风格会重置）
+    raygui.set_style(raygui.DEFAULT, raygui.TEXT_SIZE, 20)
+    raygui.set_style(raygui.DEFAULT, raygui.TEXT_PADDING, 4)
+    raygui.set_style(raygui.DEFAULT, raygui.TEXT_ALIGNMENT, raygui.TEXT_ALIGN_LEFT)
+    print("[风格] 切换到: " .. STYLE_NAMES[style_cycle])
+end
 
 raygui.set_style(raygui.DEFAULT, raygui.TEXT_SIZE, 20)
 raygui.set_style(raygui.DEFAULT, raygui.TEXT_PADDING, 4)
@@ -202,9 +215,6 @@ end
 while not raygui.should_close() do
     raygui.begin()
 
-    -- 背景面板
-    raygui.panel(0, 0, 910, 870, "")
-
     -- dropdown 展开 / 对话框 / 背包弹出时锁定其它控件（避免点击穿透），最后再置顶绘制它们
     if dropdown_open or confirm_open or bag_open or view3d_open then raygui.lock() end
 
@@ -281,9 +291,9 @@ while not raygui.should_close() do
     if raygui.button(410, 572, 120, 36, "#5# 打开")   then print("打开被点击") end
     if raygui.button(535, 572, 120, 36, "#6# 保存")   then print("保存被点击") end
     if raygui.button(660, 572, 120, 36, "#9# 删除")   then confirm_open = true end  -- 弹确认框
-    -- 第二行：设置按钮 + 图标标签 + 带图标的复选框
-    raygui.button(35, 614, 120, 36, "#141# 设置")
-    raygui.label(165, 618, 230, 28, "#186# 你好 RayGUI!")          -- ♥ + 文字
+    -- 第二行：设置按钮（点按轮换风格）+ 图标标签 + 带图标的复选框
+    if raygui.button(35, 614, 140, 36, "#141# 风格(" .. STYLE_NAMES[style_cycle] .. ")") then cycle_style() end
+    raygui.label(185, 618, 200, 28, "#186# 你好 RayGUI!")          -- ♥ + 文字
     -- 复选框文字单独用 label 画（label 同样支持 #iconID#，眼睛图标随之渲染）
     show_password = raygui.checkbox(405, 616, 24, 24, "", show_password)
     raygui.label(437, 618, 180, 28, "#44# 显示密码")
@@ -303,17 +313,20 @@ while not raygui.should_close() do
     end
 
     -- emoji + 文字 组合按钮（用名字引用 emoji，无需记数字）
-    if emoji_button(35,  775, 150, 36, "save",     "保存") then print("保存") end
-    if emoji_button(195, 775, 150, 36, "close",    "关闭") then print("关闭") end
-    if emoji_button(355, 775, 150, 36, "search",   "搜索") then print("搜索") end
-    if emoji_button(515, 775, 150, 36, "settings", "设置") then print("设置") end
-    if emoji_button(675, 775, 150, 36, "delete",   "删除") then print("删除") end
+    if emoji_button(35,  775, 120, 36, "save",     "保存") then print("保存") end
+    if emoji_button(165, 775, 120, 36, "close",    "关闭") then print("关闭") end
+    if emoji_button(295, 775, 120, 36, "search",   "搜索") then print("搜索") end
+    if emoji_button(425, 775, 120, 36, "settings", "设置") then print("设置") end
+    if emoji_button(555, 775, 120, 36, "delete",   "删除") then print("删除") end
 
     -- 图集采样示例：从网格里取前 26 个 emoji 排成一行（draw_emoji 自动按网格定位）
     if emoji_tex then
         for i = 0, 25 do
             draw_emoji(i, 35 + i * 30, 822, 24)
         end
+        -- draw_texture 演示：完整图集缩略图（无需源矩形裁剪）
+        raygui.draw_texture(emoji_tex, 790, 720, 100, 100)
+        raygui.label(810, 822, 80, 18, "全图缩略")
     end
 
     -- ============ 置顶层：dropdown / 背包 / 对话框（最后绘制，正确 z 序）============
