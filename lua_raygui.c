@@ -652,6 +652,10 @@ static int l_init(lua_State *L) {
     InitWindow(w, h, title);
     SetWindowMinSize(480, 360);   // keep the layout usable when shrunk
     SetTargetFPS(60);
+    // Don't let raylib's default exit key (Esc) close the window: Esc is used by
+    // the input autocomplete to dismiss its popup, and quitting a chat app on a
+    // stray Esc would be a nasty footgun. Only the title-bar close button quits.
+    SetExitKey(KEY_NULL);
     GuiLoadStyleDefault();
     // 初始化默认样式，防止错位
     GuiSetStyle(DEFAULT, TEXT_PADDING, 4);
@@ -1528,6 +1532,28 @@ static int l_mouse_down(lua_State *L) {
     return 1;
 }
 
+// is_key_pressed(code) -> bool   (raylib keycode; true on the press frame and on
+// system auto-repeat, like the textbox's own key_repeat). Lets Lua drive the
+// input autocomplete menu with ↑/↓/Esc.
+static int l_is_key_pressed(lua_State *L) {
+    int key = (int)luaL_checkinteger(L, 1);
+    lua_pushboolean(L, IsKeyPressed(key) || IsKeyPressedRepeat(key));
+    return 1;
+}
+
+// set_textbox_cursor(pos) — move the MULTILINE textbox caret to byte offset `pos`
+// and clear any selection. The next textbox_multi() call clamps it to the text
+// length. Used by the autocomplete: after the Lua side replaces the input text
+// with a completion, this drops the caret at the end (otherwise it would keep
+// its stale byte offset and the next keystroke would insert mid-text).
+static int l_set_textbox_cursor(lua_State *L) {
+    int pos = (int)luaL_checkinteger(L, 1);
+    if (pos < 0) pos = 0;
+    g_cursor_multi = pos;
+    g_sel_anchor = -1;
+    return 0;
+}
+
 // screen_size() -> w, h
 static int l_screen_size(lua_State *L) {
     lua_pushinteger(L, GetScreenWidth());
@@ -1650,6 +1676,8 @@ static const luaL_Reg raygui_lib[] = {
     {"get_wheel",       l_get_wheel},
     {"get_mouse",       l_get_mouse},
     {"mouse_down",      l_mouse_down},
+    {"is_key_pressed",  l_is_key_pressed},
+    {"set_textbox_cursor", l_set_textbox_cursor},
     {"screen_size",     l_screen_size},
     {"set_clipboard",   l_set_clipboard},
     {"get_clipboard",   l_get_clipboard},
@@ -1695,6 +1723,14 @@ static void register_consts(lua_State *L) {
     lua_pushinteger(L, 6); lua_setfield(L, -2, "CHECKBOX");
     lua_pushinteger(L, 9); lua_setfield(L, -2, "TEXTBOX");
     lua_pushinteger(L, 10); lua_setfield(L, -2, "VALUEBOX");
+
+    // Keyboard codes (raylib KeyboardKey) used by is_key_pressed for the
+    // input autocomplete menu navigation.
+    lua_pushinteger(L, 256); lua_setfield(L, -2, "KEY_ESCAPE");
+    lua_pushinteger(L, 257); lua_setfield(L, -2, "KEY_ENTER");
+    lua_pushinteger(L, 258); lua_setfield(L, -2, "KEY_TAB");
+    lua_pushinteger(L, 264); lua_setfield(L, -2, "KEY_DOWN");
+    lua_pushinteger(L, 265); lua_setfield(L, -2, "KEY_UP");
 
     // Icon constants (raygui ricons 4.x)
     lua_pushinteger(L, 0);   lua_setfield(L, -2, "ICON_NONE");
