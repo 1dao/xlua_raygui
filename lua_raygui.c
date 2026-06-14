@@ -645,7 +645,12 @@ static int l_init(lua_State *L) {
     int w = (int)luaL_checkinteger(L, 1);
     int h = (int)luaL_checkinteger(L, 2);
     const char *title = luaL_checkstring(L, 3);
+    // Resizable window: without this flag raylib/GLFW disables (greys out) the
+    // maximize button. Must be set BEFORE InitWindow. The GUI lays everything
+    // out from screen_size() each frame, so it reflows on resize/maximize.
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(w, h, title);
+    SetWindowMinSize(480, 360);   // keep the layout usable when shrunk
     SetTargetFPS(60);
     GuiLoadStyleDefault();
     // 初始化默认样式，防止错位
@@ -1516,6 +1521,13 @@ static int l_get_mouse(lua_State *L) {
     return 2;
 }
 
+// mouse_down([button]) -> bool   (button held this frame; default = left)
+static int l_mouse_down(lua_State *L) {
+    int btn = (int)luaL_optinteger(L, 1, MOUSE_LEFT_BUTTON);
+    lua_pushboolean(L, IsMouseButtonDown(btn));
+    return 1;
+}
+
 // screen_size() -> w, h
 static int l_screen_size(lua_State *L) {
     lua_pushinteger(L, GetScreenWidth());
@@ -1637,6 +1649,7 @@ static const luaL_Reg raygui_lib[] = {
     {"end_scissor",     l_end_scissor},
     {"get_wheel",       l_get_wheel},
     {"get_mouse",       l_get_mouse},
+    {"mouse_down",      l_mouse_down},
     {"screen_size",     l_screen_size},
     {"set_clipboard",   l_set_clipboard},
     {"get_clipboard",   l_get_clipboard},
