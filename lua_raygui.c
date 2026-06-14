@@ -1024,6 +1024,7 @@ static int l_textbox_multi(lua_State *L) {
                             memmove(g_buf_multi + g_cursor_multi + cl, g_buf_multi + g_cursor_multi, len - g_cursor_multi + 1);
                             memcpy(g_buf_multi + g_cursor_multi, clip, cl);
                             g_cursor_multi += cl; len += cl;
+                            g_sel_anchor = -1;   // pasted text isn't left selected
                         }
                     }
                 } else if (clipboard_has_image()) {
@@ -1049,6 +1050,11 @@ static int l_textbox_multi(lua_State *L) {
                 memcpy(g_buf_multi + g_cursor_multi, utf8, bytes);
                 g_cursor_multi += bytes;
                 len += bytes;
+                // Typing collapses any selection — without this, a focus-click
+                // (which sets anchor == cursor) would, after the first char,
+                // leave anchor behind the advanced cursor and spuriously
+                // "select" that first char, so the next keystroke deletes it.
+                g_sel_anchor = -1;
             }
         }
 
