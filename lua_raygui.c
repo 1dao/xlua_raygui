@@ -790,12 +790,28 @@ static int l_textbox(lua_State *L) {
         }
     }
 
-    // 安全边界检查，防止外部数据导致光标越界
-    if (g_cursor_single > len) g_cursor_single = len;
-    if (g_cursor_single < 0) g_cursor_single = 0;
-
     // 2. 处于聚焦状态下，由 C 层全权负责文本插入、删除与光标左右移动
     if (editMode) {
+        // 安全边界检查（只对聚焦框做：同一帧若有多个单行框，共享光标 g_cursor_single
+        // 不能被未聚焦框按各自长度夹坏，否则在多输入框页面里光标会乱跳）
+        if (g_cursor_single > len) g_cursor_single = len;
+        if (g_cursor_single < 0) g_cursor_single = 0;
+
+        // A0. Ctrl+V 粘贴：把剪贴板文本插入到光标处（单行框，过滤换行/制表符）
+        if ((IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_V)) {
+            const char *clip = GetClipboardText();
+            if (clip) {
+                for (const char *pc = clip; *pc; pc++) {
+                    if (*pc == '\n' || *pc == '\r' || *pc == '\t') continue;
+                    if (len + 1 >= TEXT_BUF_SINGLE - 1) break;
+                    memmove(g_buf_single + g_cursor_single + 1, g_buf_single + g_cursor_single, len - g_cursor_single + 1);
+                    g_buf_single[g_cursor_single] = *pc;
+                    g_cursor_single += 1;
+                    len += 1;
+                }
+            }
+        }
+
         // A. 捕获键盘流及中文 IME 输入，并精准插入到当前光标所在位置
         int cp;
         while ((cp = GetCharPressed()) > 0) {
