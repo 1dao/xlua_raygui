@@ -25,9 +25,11 @@
 #define GUI_WINDOW_FILE_DIALOG_IMPLEMENTATION
 #include "gui_window_file_dialog.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "lua.h"
 #include "lualib.h"
@@ -85,6 +87,17 @@ static char g_buf_multi[TEXT_BUF_MULTI]   = {0};
 static Font g_font = {0};
 static char g_font_path[FONT_PATH_MAX] = {0};
 static int g_font_size = 0;
+// 一份字体的 sfnt 字节流：主字体和回退字体各持一份
+typedef struct {
+    unsigned char *data;    // 字节流（映射视图或堆缓冲；.ttc 已定位到单个 face）
+    int size;
+    bool mapped;            // data 是映射视图还是 malloc 出来的
+    char type[8];           // 格式后缀
+} FontFile;
+
+static FontFile g_font_file = { NULL, 0, false, ".ttf" };
+static FontFile g_fb_file = { NULL, 0, false, ".ttf" };
+static bool g_fb_probed = false;            // 回退字体只探测一次
 static int g_font_codepoints[FONT_CODEPOINT_MAX] = {0};
 static int g_font_codepoint_count = 0;
 static unsigned char g_font_codepoint_bits[FONT_CODEPOINT_BITS] = {0};
@@ -182,17 +195,410 @@ static bool font_add_text(const char *text, bool *overflow) {
     return changed;
 }
 
+//----------------------------------------------------------------------------
+// 字体文件加载
+//
+// 一、优先内存映射：字体文件按页惰性加载，只有真正取过字形的页才进物理内存，且这
+//     些是干净的文件页，系统有内存压力时可直接回收（不必写 pagefile）。实测 15.6MB
+//     的等线，渲染 demo 全部界面文本只驻留约 1.5MB。
+//
+// 二、TTC 集合：raylib 只按扩展名分派 .ttf/.otf/.bdf，.ttc 一律判为不支持并静默退回
+//     默认字体；而 mac/Linux 上可用的中文字体几乎全是 .ttc。好在 TTC 里每个 face 的
+//     表目录记的就是相对文件头的绝对偏移——正是 stb_truetype 期望的形式，raylib 只
+//     是把解析起点写死成 0。于是用写时复制映射把目标 face 的表目录搬到偏移 0，整个
+//     映射当场就是一份合法 sfnt，表数据一个字节都不用搬，只脏掉开头一页。
+//
+// 三、映射不可用（网络路径、异常文件系统）或 TTC 布局特殊时，退回“读进堆里 + 复制
+//     抽取”的老路子：行为完全一致，只是要多占一份文件大小的内存。
+//
+// 字节流常驻：动态补字重建图集时不必反复重读字体文件。
+//----------------------------------------------------------------------------
+#if defined(_WIN32)
+/* 同剪贴板：不能引 windows.h，手工声明映射所需的 kernel32 函数。 */
+__declspec(dllimport) void * __stdcall CreateFileA(const char *name, unsigned long access,
+                                                   unsigned long share, void *sa,
+                                                   unsigned long creation, unsigned long flags,
+                                                   void *templateFile);
+__declspec(dllimport) int __stdcall GetFileSizeEx(void *file, long long *size);
+__declspec(dllimport) void * __stdcall CreateFileMappingA(void *file, void *sa,
+                                                          unsigned long protect,
+                                                          unsigned long maxHigh,
+                                                          unsigned long maxLow, const char *name);
+__declspec(dllimport) void * __stdcall MapViewOfFile(void *mapping, unsigned long access,
+                                                     unsigned long offHigh, unsigned long offLow,
+                                                     size_t bytes);
+__declspec(dllimport) int __stdcall UnmapViewOfFile(const void *base);
+__declspec(dllimport) int __stdcall CloseHandle(void *handle);
+#define WIN32_GENERIC_READ          0x80000000UL
+#define WIN32_FILE_SHARE_ALL        0x00000007UL   /* READ|WRITE|DELETE：别把字体文件锁死 */
+#define WIN32_OPEN_EXISTING         3UL
+#define WIN32_FILE_ATTRIBUTE_NORMAL 0x00000080UL
+#define WIN32_PAGE_WRITECOPY        0x00000008UL
+#define WIN32_FILE_MAP_COPY         0x00000001UL
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+// 以写时复制方式映射整个文件，失败返回 NULL（调用方退回堆路径）。
+static unsigned char *font_map_file(const char *path, int *outSize) {
+#if defined(_WIN32)
+    void *file = CreateFileA(path, WIN32_GENERIC_READ, WIN32_FILE_SHARE_ALL, NULL,
+                             WIN32_OPEN_EXISTING, WIN32_FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == (void *)(intptr_t)-1) return NULL;   /* INVALID_HANDLE_VALUE */
+
+    long long size = 0;
+    if (!GetFileSizeEx(file, &size) || size <= 0 || size > (long long)INT_MAX) {
+        CloseHandle(file);
+        return NULL;
+    }
+
+    /* 视图建好后文件句柄和映射对象都可以立刻关掉，系统会替我们留住底层文件。 */
+    void *mapping = CreateFileMappingA(file, NULL, WIN32_PAGE_WRITECOPY, 0, 0, NULL);
+    CloseHandle(file);
+    if (mapping == NULL) return NULL;
+    void *base = MapViewOfFile(mapping, WIN32_FILE_MAP_COPY, 0, 0, 0);
+    CloseHandle(mapping);
+    if (base == NULL) return NULL;
+
+    *outSize = (int)size;
+    return (unsigned char *)base;
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
+        (unsigned long long)st.st_size > (unsigned long long)INT_MAX) {
+        close(fd);
+        return NULL;
+    }
+
+    /* MAP_PRIVATE：写进去的内容只落到本进程的私有副本，不会回写字体文件。 */
+    void *base = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) return NULL;
+
+    *outSize = (int)st.st_size;
+    return (unsigned char *)base;
+#endif
+}
+
+static void font_unmap(unsigned char *base, int size) {
+#if defined(_WIN32)
+    (void)size;
+    UnmapViewOfFile(base);
+#else
+    munmap(base, (size_t)size);
+#endif
+}
+
+static unsigned int font_rd_u32(const unsigned char *p) {
+    return ((unsigned int)p[0] << 24) | ((unsigned int)p[1] << 16) |
+           ((unsigned int)p[2] << 8) | (unsigned int)p[3];
+}
+
+static unsigned int font_rd_u16(const unsigned char *p) {
+    return ((unsigned int)p[0] << 8) | (unsigned int)p[1];
+}
+
+static void font_wr_u32(unsigned char *p, unsigned int v) {
+    p[0] = (unsigned char)(v >> 24);
+    p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);
+    p[3] = (unsigned char)v;
+}
+
+// 定位 TTC 里第 face 个字体的表目录（越界退回 face 0），顺带校验头部可读。
+static bool font_ttc_face(const unsigned char *data, int size, int face,
+                          unsigned int *outDir, unsigned int *outTables) {
+    unsigned long long total = (unsigned long long)size;
+    if (size < 16 || memcmp(data, "ttcf", 4) != 0) return false;
+
+    unsigned int count = font_rd_u32(data + 8);
+    if (count == 0 || 12ULL + 4ULL * count > total) return false;
+    if (face < 0 || (unsigned int)face >= count) face = 0;
+
+    unsigned int dir = font_rd_u32(data + 12 + 4 * (unsigned int)face);
+    if ((unsigned long long)dir + 12ULL > total) return false;
+    unsigned int tables = font_rd_u16(data + dir + 4);
+    if (tables == 0 || (unsigned long long)dir + 12ULL + 16ULL * tables > total) return false;
+
+    *outDir = dir;
+    *outTables = tables;
+    return true;
+}
+
+// 就地重定位（映射路径）：把 face 的表目录搬到偏移 0，表数据原地不动。
+// 前提是头部不会压到任何一张表的数据上；不成立时返回 false，交给复制抽取处理。
+static bool font_ttc_relocate(unsigned char *data, int size, int face) {
+    unsigned int dir = 0, tables = 0;
+    if (!font_ttc_face(data, size, face, &dir, &tables)) return false;
+
+    unsigned long long total = (unsigned long long)size;
+    unsigned long long head = 12ULL + 16ULL * tables;      // sfnt 头 + 表目录
+    for (unsigned int i = 0; i < tables; i++) {
+        const unsigned char *rec = data + dir + 12 + 16 * i;
+        unsigned long long off = font_rd_u32(rec + 8);
+        unsigned long long len = font_rd_u32(rec + 12);
+        if (off + len > total) return false;
+        if (off < head) return false;                      // 表数据压在头部位置上，搬不了
+    }
+
+    memmove(data, data + dir, (size_t)head);               // 目标区域与源重叠，必须 memmove
+    return true;
+}
+
+// 复制抽取（堆路径）：把 face 的各张表复制出来、重排偏移，拼成独立的 sfnt 字节流。
+static unsigned char *font_ttc_extract(const unsigned char *data, int size, int face, int *outSize) {
+    unsigned int dir = 0, tables = 0;
+    if (!font_ttc_face(data, size, face, &dir, &tables)) return NULL;
+
+    unsigned long long total = (unsigned long long)size;
+    unsigned long long head = 12ULL + 16ULL * tables;
+    unsigned long long need = head;
+    for (unsigned int i = 0; i < tables; i++) {
+        const unsigned char *rec = data + dir + 12 + 16 * i;
+        unsigned long long off = font_rd_u32(rec + 8);
+        unsigned long long len = font_rd_u32(rec + 12);
+        if (off + len > total) return NULL;
+        need += (len + 3ULL) & ~3ULL;                      // 表数据 4 字节对齐
+    }
+    if (need > (unsigned long long)INT_MAX) return NULL;
+
+    unsigned char *out = (unsigned char *)calloc(1, (size_t)need);
+    if (out == NULL) return NULL;
+    memcpy(out, data + dir, (size_t)head);                 // 头和表目录原样搬过来
+    unsigned long long cursor = head;
+    for (unsigned int i = 0; i < tables; i++) {
+        const unsigned char *rec = data + dir + 12 + 16 * i;
+        unsigned int off = font_rd_u32(rec + 8);
+        unsigned int len = font_rd_u32(rec + 12);
+        memcpy(out + cursor, data + off, len);
+        font_wr_u32(out + 12 + 16 * i + 8, (unsigned int)cursor);   // 偏移改写到新流内
+        cursor += ((unsigned long long)len + 3ULL) & ~3ULL;
+    }
+
+    *outSize = (int)need;
+    return out;
+}
+
+static void font_file_free(FontFile *f) {
+    if (f->data != NULL) {
+        if (f->mapped) font_unmap(f->data, f->size);
+        else free(f->data);
+        f->data = NULL;
+    }
+    f->size = 0;
+    f->mapped = false;
+}
+
+// 重定位过的 TTC 已经是裸 sfnt，按 .ttf 交给 raylib；其余按文件扩展名。
+static void font_set_type(FontFile *f, const char *ext) {
+    strncpy(f->type, (ext != NULL && ext[0] != '\0') ? ext : ".ttf", sizeof(f->type) - 1);
+    f->type[sizeof(f->type) - 1] = '\0';
+}
+
+static bool font_file_load(FontFile *f, const char *path, int face) {
+    font_file_free(f);
+
+    int size = 0;
+    unsigned char *base = font_map_file(path, &size);
+    if (base != NULL) {
+        bool isTTC = (size >= 4 && memcmp(base, "ttcf", 4) == 0);
+        if (!isTTC || font_ttc_relocate(base, size, face)) {
+            f->data = base;
+            f->size = size;
+            f->mapped = true;
+            font_set_type(f, isTTC ? ".ttf" : GetFileExtension(path));
+            return true;
+        }
+        font_unmap(base, size);            // 布局不允许就地重定位，退回复制抽取
+    }
+
+    size = 0;
+    unsigned char *raw = LoadFileData(path, &size);
+    if (raw == NULL || size <= 0) {
+        if (raw != NULL) UnloadFileData(raw);
+        return false;
+    }
+
+    if (size >= 4 && memcmp(raw, "ttcf", 4) == 0) {
+        int outSize = 0;
+        f->data = font_ttc_extract(raw, size, face, &outSize);
+        f->size = outSize;
+        font_set_type(f, ".ttf");
+    } else {
+        f->data = (unsigned char *)malloc((size_t)size);
+        if (f->data != NULL) {
+            memcpy(f->data, raw, (size_t)size);
+            f->size = size;
+        }
+        font_set_type(f, GetFileExtension(path));
+    }
+
+    UnloadFileData(raw);
+    if (f->data == NULL) {
+        f->size = 0;
+        return false;
+    }
+    return true;
+}
+
+// 读裸 sfnt 的表目录，取一张表的位置（data 此时已是单个字体，TTC 已重定位/抽取）。
+static bool font_sfnt_table(const unsigned char *data, int size, const char *tag,
+                            unsigned int *outOff, unsigned int *outLen) {
+    if (size < 12) return false;
+    unsigned int tables = font_rd_u16(data + 4);
+    if (12ULL + 16ULL * tables > (unsigned long long)size) return false;
+
+    for (unsigned int i = 0; i < tables; i++) {
+        const unsigned char *rec = data + 12 + 16 * i;
+        if (memcmp(rec, tag, 4) != 0) continue;
+        unsigned int off = font_rd_u32(rec + 8);
+        unsigned int len = font_rd_u32(rec + 12);
+        if ((unsigned long long)off + len > (unsigned long long)size) return false;
+        *outOff = off;
+        *outLen = len;
+        return true;
+    }
+    return false;
+}
+
+// 字形顶端到基线的像素距离，算法与 raylib 一致（ascent * fontSize/(ascent-descent)，取自 hhea）。
+// 合并两个字体的字形时用它对齐：不补偿的话回退来的符号会整体相对文字上下错开。
+static float font_baseline(const unsigned char *data, int size, int fontSize) {
+    unsigned int off = 0, len = 0;
+    if (!font_sfnt_table(data, size, "hhea", &off, &len) || len < 8) return 0.0f;
+
+    int ascent = (short)font_rd_u16(data + off + 4);
+    int descent = (short)font_rd_u16(data + off + 6);
+    if (ascent - descent <= 0) return 0.0f;
+    return (float)fontSize * (float)ascent / (float)(ascent - descent);
+}
+
+// 回退字体：中文字体普遍不含 ☀✈⭐❤ 这类符号（实测等线/黑体/雅黑/宋体全是 0/16），
+// 而符号字体又不含中文，没有任何单个字体能同时覆盖，只能主字体缺什么就去回退字体取。
+// 只在主字体确实缺字形时才打开，且探测一次就记住结果。
+static bool font_fallback_open(void) {
+    if (g_fb_file.data != NULL) return true;
+    if (g_fb_probed) return false;
+    g_fb_probed = true;
+
+    static const char *const candidates[] = {
+#if defined(_WIN32)
+        "C:/Windows/Fonts/seguisym.ttf",                        /* Segoe UI Symbol，实测 16/16 */
+        "C:/Windows/Fonts/seguiemj.ttf",                        /* Segoe UI Emoji（取其单色轮廓） */
+        "C:/Windows/Fonts/arialuni.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/Symbol.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+#else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+#endif
+    };
+
+    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        if (!FileExists(candidates[i])) continue;
+        if (font_file_load(&g_fb_file, candidates[i], 0)) return true;
+    }
+    return false;
+}
+
+// 主字体 + 回退字体合并成一张图集。步骤与 raylib 的 LoadFontFromMemory 内部一致，
+// 只是中间插了一步"缺的字形去回退字体补"。
 static bool font_reload(void) {
     if (g_font_path[0] == '\0' || g_font_size <= 0 || g_font_codepoint_count <= 0) {
         return false;
     }
-
-    Font font = LoadFontEx(g_font_path, g_font_size, g_font_codepoints, g_font_codepoint_count);
-    if (font.texture.id == 0 || font.glyphCount <= 0 || font.baseSize != g_font_size) {
-        if (font.texture.id != 0) UnloadFont(font);
+    if (g_font_file.data == NULL || g_font_file.size <= 0) {
         return false;
     }
 
+    /* 1) 主字体。raylib 只为字体里真有的码位建字形，缺的直接丢掉（顺序与请求一致），
+     *    字体格式不支持时返回 NULL——load_system_font 靠这个继续试下一个候选。 */
+    int mainCount = 0;
+    GlyphInfo *glyphs = LoadFontData(g_font_file.data, g_font_file.size, g_font_size,
+                                     g_font_codepoints, g_font_codepoint_count,
+                                     FONT_DEFAULT, &mainCount);
+    if (glyphs == NULL || mainCount <= 0) {
+        if (glyphs != NULL) UnloadFontData(glyphs, mainCount);
+        return false;
+    }
+
+    /* 2) 主字体缺的码位交给回退字体 */
+    int total = mainCount;
+    if (mainCount < g_font_codepoint_count && font_fallback_open()) {
+        int cap = g_font_codepoint_count - mainCount;
+        int *missing = (int *)malloc(sizeof(int) * (size_t)cap);
+        if (missing != NULL) {
+            int missCount = 0, mi = 0;
+            for (int i = 0; i < g_font_codepoint_count && missCount < cap; i++) {
+                if (mi < mainCount && glyphs[mi].value == g_font_codepoints[i]) { mi++; continue; }
+                missing[missCount++] = g_font_codepoints[i];
+            }
+
+            int fbCount = 0;
+            GlyphInfo *fb = (missCount > 0)
+                          ? LoadFontData(g_fb_file.data, g_fb_file.size, g_font_size,
+                                         missing, missCount, FONT_DEFAULT, &fbCount)
+                          : NULL;
+            free(missing);
+
+            if (fb != NULL && fbCount > 0) {
+                int shift = (int)font_baseline(g_font_file.data, g_font_file.size, g_font_size)
+                          - (int)font_baseline(g_fb_file.data, g_fb_file.size, g_font_size);
+                if (shift != 0) {
+                    for (int i = 0; i < fbCount; i++) fb[i].offsetY += shift;
+                }
+
+                GlyphInfo *merged = (GlyphInfo *)MemAlloc(
+                    (unsigned int)((size_t)(mainCount + fbCount) * sizeof(GlyphInfo)));
+                if (merged != NULL) {
+                    memcpy(merged, glyphs, (size_t)mainCount * sizeof(GlyphInfo));
+                    memcpy(merged + mainCount, fb, (size_t)fbCount * sizeof(GlyphInfo));
+                    MemFree(glyphs);      // 只回收数组容器，字形位图的所有权转给 merged
+                    MemFree(fb);
+                    glyphs = merged;
+                    total = mainCount + fbCount;
+                } else {
+                    UnloadFontData(fb, fbCount);
+                }
+            } else if (fb != NULL) {
+                UnloadFontData(fb, fbCount);
+            }
+        }
+    }
+
+    /* 3) 打包图集并组装 Font */
+    Font font = {0};
+    font.baseSize = g_font_size;
+    font.glyphCount = total;
+    font.glyphPadding = 4;                // 同 raylib 内部的 FONT_TTF_DEFAULT_CHARS_PADDING
+    font.glyphs = glyphs;
+
+    Image atlas = GenImageFontAtlas(font.glyphs, &font.recs, font.glyphCount,
+                                    font.baseSize, font.glyphPadding, 0);
+    font.texture = LoadTextureFromImage(atlas);
+    for (int i = 0; i < font.glyphCount; i++) {   // 字形位图改指向图集内的切片，与 raylib 一致
+        UnloadImage(font.glyphs[i].image);
+        font.glyphs[i].image = ImageFromImage(atlas, font.recs[i]);
+    }
+    UnloadImage(atlas);
+
+    if (font.texture.id == 0) {
+        UnloadFont(font);
+        return false;
+    }
+
+    // 新图集会重置过滤方式，每次重建都要设一遍
+    SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
     if (g_font.texture.id != 0) UnloadFont(g_font);
     g_font = font;
     GuiSetFont(g_font);
@@ -234,6 +640,9 @@ static void font_reset(void) {
         UnloadFont(g_font);
         g_font = (Font){0};
     }
+    font_file_free(&g_font_file);
+    font_file_free(&g_fb_file);
+    g_fb_probed = false;
     g_font_path[0] = '\0';
     g_font_size = 0;
     g_font_codepoint_count = 0;
@@ -639,6 +1048,156 @@ static int l_model_view(lua_State *L) {
 }
 
 //============================================================================
+// scene3d：地形检视视图。Lua 侧喂一张灰度高度图（生成网格 + 同图作明暗贴图）
+// 和一组彩色方块（行走层/可飞区间/障碍柱），C 侧离屏渲染 + 轨道相机，贴回
+// 面板矩形——与 model_view 相同的"3D 当控件"集成模式。
+//============================================================================
+static Model    g_s3d_model;
+static Texture2D g_s3d_tex;
+static bool     g_s3d_has_model = false;
+static float   *g_s3d_boxes = NULL;     // 10 floats/box: xyz, sxyz, rgba
+static int      g_s3d_box_count = 0;
+static RenderTexture2D g_s3d_rt = {0};
+static int      g_s3d_rt_w = 0, g_s3d_rt_h = 0;
+
+static void scene3d_free(void) {
+    if (g_s3d_has_model) {
+        UnloadModel(g_s3d_model);
+        UnloadTexture(g_s3d_tex);
+        g_s3d_has_model = false;
+    }
+    if (g_s3d_boxes) { free(g_s3d_boxes); g_s3d_boxes = NULL; g_s3d_box_count = 0; }
+    if (g_s3d_rt.id != 0) { UnloadRenderTexture(g_s3d_rt); g_s3d_rt = (RenderTexture2D){0}; }
+    g_s3d_rt_w = g_s3d_rt_h = 0;
+}
+
+// scene3d_heightmap(gray_bytes, w, h, size_x, size_y, size_z)
+//   gray_bytes: w*h 字节，0..255 -> 高度 0..size_y；网格覆盖 [0,size_x]x[0,size_z]
+//   （raylib Y 轴向上；Lua 侧负责把游戏坐标映射过来）。重复调用替换旧网格。
+static int l_scene3d_heightmap(lua_State *L) {
+    size_t n = 0;
+    const char *data = luaL_checklstring(L, 1, &n);
+    int w = (int)luaL_checkinteger(L, 2);
+    int h = (int)luaL_checkinteger(L, 3);
+    float sx = (float)luaL_checknumber(L, 4);
+    float sy = (float)luaL_checknumber(L, 5);
+    float sz = (float)luaL_checknumber(L, 6);
+    if (w < 2 || h < 2 || n != (size_t)(w * h)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "gray_bytes size != w*h (or grid < 2)");
+        return 2;
+    }
+    if (g_s3d_has_model) {
+        UnloadModel(g_s3d_model);
+        UnloadTexture(g_s3d_tex);
+        g_s3d_has_model = false;
+    }
+    Image img = {
+        .data = (void *)data,           // GenMeshHeightmap 只读；调用期内有效
+        .width = w, .height = h,
+        .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_GRAYSCALE,
+    };
+    Mesh mesh = GenMeshHeightmap(img, (Vector3){ sx, sy, sz });
+    g_s3d_model = LoadModelFromMesh(mesh);
+    g_s3d_tex = LoadTextureFromImage(img);  // 同一张灰度图当明暗贴图，起伏可读
+    g_s3d_model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = g_s3d_tex;
+    g_s3d_has_model = true;
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// scene3d_boxes(flat_table) -- 每 10 个数一个方块：中心 x,y,z、尺寸 sx,sy,sz、
+// 颜色 r,g,b,a。传空表清空。
+static int l_scene3d_boxes(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int len = (int)lua_rawlen(L, 1);
+    if (len % 10 != 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "box table length must be a multiple of 10");
+        return 2;
+    }
+    if (g_s3d_boxes) { free(g_s3d_boxes); g_s3d_boxes = NULL; }
+    g_s3d_box_count = 0;
+    if (len > 0) {
+        // 先装满再挂上去：中途失败时不会留下 count > 0 却是空指针的状态
+        float *boxes = (float *)malloc(sizeof(float) * (size_t)len);
+        if (boxes == NULL) {
+            lua_pushnil(L);
+            lua_pushstring(L, "out of memory");
+            return 2;
+        }
+        for (int i = 0; i < len; i++) {
+            lua_rawgeti(L, 1, i + 1);
+            boxes[i] = (float)lua_tonumber(L, -1);
+            lua_pop(L, 1);
+        }
+        g_s3d_boxes = boxes;
+        g_s3d_box_count = len / 10;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// scene3d_view(x, y, w, h, yaw_deg, pitch_deg, dist, tx, ty, tz)
+//   在面板矩形内渲染当前场景，轨道相机绕 (tx,ty,tz) 旋转。
+static int l_scene3d_view(lua_State *L) {
+    float x = (float)luaL_checknumber(L, 1);
+    float y = (float)luaL_checknumber(L, 2);
+    float w = (float)luaL_checknumber(L, 3);
+    float h = (float)luaL_checknumber(L, 4);
+    float yaw = (float)luaL_checknumber(L, 5) * DEG2RAD;
+    float pitch = (float)luaL_checknumber(L, 6) * DEG2RAD;
+    float dist = (float)luaL_checknumber(L, 7);
+    float tx = (float)luaL_checknumber(L, 8);
+    float ty = (float)luaL_checknumber(L, 9);
+    float tz = (float)luaL_checknumber(L, 10);
+    int iw = (int)w, ih = (int)h;
+    if (iw < 1) iw = 1;
+    if (ih < 1) ih = 1;
+
+    if (g_s3d_rt.id == 0 || g_s3d_rt_w != iw || g_s3d_rt_h != ih) {
+        if (g_s3d_rt.id != 0) UnloadRenderTexture(g_s3d_rt);
+        g_s3d_rt = LoadRenderTexture(iw, ih);
+        g_s3d_rt_w = iw;
+        g_s3d_rt_h = ih;
+    }
+
+    Camera3D cam = {0};
+    float cp = cosf(pitch);
+    cam.position = (Vector3){ tx + dist * cp * cosf(yaw),
+                              ty + dist * sinf(pitch),
+                              tz + dist * cp * sinf(yaw) };
+    cam.target = (Vector3){ tx, ty, tz };
+    cam.up = (Vector3){ 0.0f, 1.0f, 0.0f };
+    cam.fovy = 45.0f;
+    cam.projection = CAMERA_PERSPECTIVE;
+
+    BeginTextureMode(g_s3d_rt);
+        ClearBackground((Color){ 24, 26, 32, 255 });
+        BeginMode3D(cam);
+            if (g_s3d_has_model) {
+                DrawModel(g_s3d_model, (Vector3){ 0, 0, 0 }, 1.0f, WHITE);
+            }
+            for (int i = 0; i < g_s3d_box_count; i++) {
+                const float *b = g_s3d_boxes + i * 10;
+                Vector3 pos = { b[0], b[1], b[2] };
+                Vector3 size = { b[3], b[4], b[5] };
+                Color c = { (unsigned char)b[6], (unsigned char)b[7],
+                            (unsigned char)b[8], (unsigned char)b[9] };
+                DrawCubeV(pos, size, c);
+                Color wire = c; wire.a = 255;
+                DrawCubeWiresV(pos, size, wire);
+            }
+        EndMode3D();
+    EndTextureMode();
+
+    Rectangle src = { 0.0f, 0.0f, (float)iw, -(float)ih };
+    Rectangle dst = { x, y, w, h };
+    DrawTexturePro(g_s3d_rt.texture, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
+    return 0;
+}
+
+//============================================================================
 // 窗口渲染
 //============================================================================
 static int l_init(lua_State *L) {
@@ -668,6 +1227,7 @@ static int l_close(lua_State *L) {
     font_reset();
     texture_free_all();
     model_view_free();
+    scene3d_free();
     CloseWindow();
     return 0;
 }
@@ -1450,11 +2010,14 @@ static int l_set_style(lua_State *L) {
     return 0;
 }
 
+// load_font(path, size [, charset [, face]])
+//   face 只对 .ttc 集合有意义：取集合里的第几个字体，越界自动退回第 0 个。
 static int l_load_font(lua_State *L)
 {
     const char *path = luaL_checkstring(L, 1);
     int fontSize = (int)luaL_checkinteger(L, 2);
     const char *charset = luaL_optstring(L, 3, NULL);
+    int face = (int)luaL_optinteger(L, 4, 0);
 
     font_reset();
     strncpy(g_font_path, path, FONT_PATH_MAX - 1);
@@ -1463,15 +2026,67 @@ static int l_load_font(lua_State *L)
     font_seed_ascii();
     font_add_text(charset, NULL);
 
-    if (!font_reload()) {
-        g_font_path[0] = '\0';
-        g_font_size = 0;
-        g_font_codepoint_count = 0;
+    if (!font_file_load(&g_font_file, path, face) || !font_reload()) {
+        font_reset();
         lua_pushboolean(L, 0);
         return 1;
     }
 
     lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* Load a CJK-capable font from the host system.  The generated Font is kept
+ * in the same global slot as load_font(), so raygui and custom drawing share it.
+ * load_system_font(size [, charset]) -> bool */
+static int l_load_system_font(lua_State *L)
+{
+    int fontSize = (int)luaL_checkinteger(L, 1);
+    luaL_optstring(L, 2, NULL);   /* 只做类型校验：指针不能跨栈改写继续用 */
+
+    /* face 是 .ttc 集合里的字体序号，见 font_ttc_extract()；非集合字体填 0。 */
+    static const struct { const char *path; int face; } candidates[] = {
+#if defined(_WIN32)
+        /* 等线是中英混排最耐看的一款，其次黑体；雅黑/宋体是 TTC 集合。 */
+        { "C:/Windows/Fonts/Deng.ttf",   0 },   /* 等线 */
+        { "C:/Windows/Fonts/simhei.ttf", 0 },   /* 黑体 */
+        { "C:/Windows/Fonts/msyh.ttc",   0 },   /* 微软雅黑 */
+        { "C:/Windows/Fonts/simsun.ttc", 0 },   /* 宋体 */
+#elif defined(__APPLE__)
+        { "/System/Library/Fonts/PingFang.ttc",                   0 },
+        { "/System/Library/Fonts/Hiragino Sans GB.ttc",           0 },
+        { "/System/Library/Fonts/STHeiti Light.ttc",              0 },
+        { "/System/Library/Fonts/Supplemental/Songti.ttc",        0 },
+        { "/System/Library/Fonts/Supplemental/Arial Unicode.ttf", 0 },
+#else
+        /* Noto Sans CJK 集合的 face 顺序一般是 JP/KR/SC/TC/HK，取 2 拿简体字形。 */
+        { "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",   2 },
+        { "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", 2 },
+        { "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",        2 },
+        { "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf", 0 },
+        { "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",           0 },
+        { "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",             0 },
+        { "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",               0 },
+        { "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0 },
+        { "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",          0 },  /* 兜底，无中文 */
+#endif
+    };
+
+    /* 按 load_font(path, size, charset, face) 摆好参数。charset 先在槽 3 留一份：
+     * 覆盖槽 2 后原字符串就没有栈引用了，Lua 的字符串指针只在值留在栈上时有效。 */
+    lua_settop(L, 2);
+    lua_pushvalue(L, 2);
+    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        if (!FileExists(candidates[i].path)) continue;
+        lua_settop(L, 3);
+        lua_pushstring(L, candidates[i].path); lua_replace(L, 1);
+        lua_pushinteger(L, fontSize);          lua_replace(L, 2);
+        lua_pushinteger(L, candidates[i].face);
+        l_load_font(L);
+        if (lua_toboolean(L, -1)) return 1;
+        lua_pop(L, 1);
+    }
+    lua_pushboolean(L, 0);
     return 1;
 }
 
@@ -1668,6 +2283,7 @@ static const luaL_Reg raygui_lib[] = {
     {"is_mouse_over_ui",l_is_mouse_over_ui},
     {"set_style",       l_set_style},
     {"load_font",       l_load_font},
+    {"load_system_font", l_load_system_font},
     {"load_texture",    l_load_texture},
     {"load_texture_mem", l_load_texture_mem},
     {"unload_texture",  l_unload_texture},
@@ -1684,6 +2300,9 @@ static const luaL_Reg raygui_lib[] = {
     {"unlock",          l_unlock},
     {"is_locked",       l_is_locked},
     {"model_view",      l_model_view},
+    {"scene3d_heightmap", l_scene3d_heightmap},
+    {"scene3d_boxes",   l_scene3d_boxes},
+    {"scene3d_view",    l_scene3d_view},
     {"measure_text",    l_measure_text},
     {"draw_text",       l_draw_text},
     {"draw_rectangle",  l_draw_rectangle},

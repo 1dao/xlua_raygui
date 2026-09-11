@@ -14,9 +14,15 @@ end
 -- 初始化窗口
 raygui.init(910, 870, "RayGUI Lua Test")
 
--- 加载中文字体
+-- 系统字体优先（Windows 默认等线，macOS 苹方，Linux Noto CJK/文泉驿），
+-- 20px 生成字形，16px 显示；控件仍按内容动态补字。
+-- 想用自带字体就换成下面注释的那行：load_font(路径, 字号 [, 预置字符集 [, face]])，
+-- face 是 .ttc 字体集合里的序号（如 msyh.ttc 的 0=微软雅黑、1=雅黑 UI），默认 0。
+local FONT_ATLAS_SIZE = 20
+local FONT_SIZE = 18
 local font_path = script_dir() .. "/fonts/NotoSansSC-Regular.otf"
-assert(raygui.load_font(font_path, 20), "Font load failed...")
+-- assert(raygui.load_system_font(FONT_ATLAS_SIZE), "System font load failed...")
+assert(raygui.load_font(font_path, FONT_ATLAS_SIZE), "Font load failed...")
 
 -- ===== 应用现代 UI 风格（选1，不用的注释掉） =====
 local STYLES_DIR = script_dir() .. "/styles"
@@ -33,13 +39,13 @@ local function cycle_style()
     local style = dofile(STYLES_DIR .. "/" .. STYLE_NAMES[style_cycle]:lower() .. ".lua")
     style.apply(raygui)
     -- 恢复字体设置（换风格会重置）
-    raygui.set_style(raygui.DEFAULT, raygui.TEXT_SIZE, 20)
+    raygui.set_style(raygui.DEFAULT, raygui.TEXT_SIZE, FONT_SIZE)
     raygui.set_style(raygui.DEFAULT, raygui.TEXT_PADDING, 4)
     raygui.set_style(raygui.DEFAULT, raygui.TEXT_ALIGNMENT, raygui.TEXT_ALIGN_LEFT)
     print("[风格] 切换到: " .. STYLE_NAMES[style_cycle])
 end
 
-raygui.set_style(raygui.DEFAULT, raygui.TEXT_SIZE, 20)
+raygui.set_style(raygui.DEFAULT, raygui.TEXT_SIZE, FONT_SIZE)
 raygui.set_style(raygui.DEFAULT, raygui.TEXT_PADDING, 4)
 raygui.set_style(raygui.DEFAULT, raygui.TEXT_ALIGNMENT, raygui.TEXT_ALIGN_LEFT)
 
