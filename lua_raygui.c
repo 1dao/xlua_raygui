@@ -1204,10 +1204,19 @@ static int l_init(lua_State *L) {
     int w = (int)luaL_checkinteger(L, 1);
     int h = (int)luaL_checkinteger(L, 2);
     const char *title = luaL_checkstring(L, 3);
+    // Optional 4th arg { undecorated = true }: no OS title bar / frame. The
+    // script then draws its own minimize / maximize / close and handles move
+    // and edge-resize itself (window_pos / set_window_pos / set_window_size).
+    unsigned int flags = FLAG_WINDOW_RESIZABLE;
+    if (lua_istable(L, 4)) {
+        lua_getfield(L, 4, "undecorated");
+        if (lua_toboolean(L, -1)) flags |= FLAG_WINDOW_UNDECORATED;
+        lua_pop(L, 1);
+    }
     // Resizable window: without this flag raylib/GLFW disables (greys out) the
     // maximize button. Must be set BEFORE InitWindow. The GUI lays everything
     // out from screen_size() each frame, so it reflows on resize/maximize.
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    SetConfigFlags(flags);
     InitWindow(w, h, title);
     SetWindowMinSize(480, 360);   // keep the layout usable when shrunk
     SetTargetFPS(60);
@@ -2192,6 +2201,72 @@ static int l_screen_size(lua_State *L) {
     return 2;
 }
 
+//============================================================================
+// Window control, for scripts that draw their own title bar (init with
+// { undecorated = true }). Positions are screen coordinates; get_mouse() is
+// window-relative, so screen mouse = window_pos() + get_mouse().
+//============================================================================
+
+// window_pos() -> x, y
+static int l_window_pos(lua_State *L) {
+    Vector2 p = GetWindowPosition();
+    lua_pushinteger(L, (lua_Integer)p.x);
+    lua_pushinteger(L, (lua_Integer)p.y);
+    return 2;
+}
+
+// set_window_pos(x, y)
+static int l_set_window_pos(lua_State *L) {
+    SetWindowPosition((int)luaL_checknumber(L, 1), (int)luaL_checknumber(L, 2));
+    return 0;
+}
+
+// set_window_size(w, h)
+static int l_set_window_size(lua_State *L) {
+    SetWindowSize((int)luaL_checknumber(L, 1), (int)luaL_checknumber(L, 2));
+    return 0;
+}
+
+// mouse_screen() -> x, y: the pointer in screen coordinates. A script moving
+// its own window needs this: window_pos() + get_mouse() lags a frame behind
+// each move (the window-relative position is from the last input event), so a
+// drag built on it jitters. Windows asks the OS directly (user32 is already
+// linked; hand-declared because windows.h clashes with raylib's names).
+#if defined(_WIN32)
+typedef struct { long x, y; } xr_point;
+__declspec(dllimport) int __stdcall GetCursorPos(xr_point *p);
+#endif
+static int l_mouse_screen(lua_State *L) {
+#if defined(_WIN32)
+    xr_point p;
+    if (GetCursorPos(&p)) {
+        lua_pushinteger(L, p.x);
+        lua_pushinteger(L, p.y);
+        return 2;
+    }
+#endif
+    Vector2 w = GetWindowPosition(), m = GetMousePosition();
+    lua_pushinteger(L, (lua_Integer)(w.x + m.x));
+    lua_pushinteger(L, (lua_Integer)(w.y + m.y));
+    return 2;
+}
+
+static int l_minimize_window(lua_State *L) { (void)L; MinimizeWindow(); return 0; }
+static int l_maximize_window(lua_State *L) { (void)L; MaximizeWindow(); return 0; }
+static int l_restore_window(lua_State *L)  { (void)L; RestoreWindow();  return 0; }
+
+static int l_is_window_maximized(lua_State *L) {
+    lua_pushboolean(L, IsWindowMaximized());
+    return 1;
+}
+
+// set_mouse_cursor(n): raylib MouseCursor (0 default, 5 resize E-W, 6 resize
+// N-S, 7 resize NW-SE, 8 resize NE-SW).
+static int l_set_mouse_cursor(lua_State *L) {
+    SetMouseCursor((int)luaL_checkinteger(L, 1));
+    return 0;
+}
+
 // get_style(control, property) -> int  (color props are 0xRRGGBBAA)
 static int l_get_style(lua_State *L) {
     int control = (int)luaL_checkinteger(L, 1);
@@ -2317,6 +2392,15 @@ static const luaL_Reg raygui_lib[] = {
     {"set_clipboard",   l_set_clipboard},
     {"get_clipboard",   l_get_clipboard},
     {"get_style",       l_get_style},
+    {"window_pos",      l_window_pos},
+    {"mouse_screen",    l_mouse_screen},
+    {"set_window_pos",  l_set_window_pos},
+    {"set_window_size", l_set_window_size},
+    {"minimize_window", l_minimize_window},
+    {"maximize_window", l_maximize_window},
+    {"restore_window",  l_restore_window},
+    {"is_window_maximized", l_is_window_maximized},
+    {"set_mouse_cursor", l_set_mouse_cursor},
     {NULL, NULL}
 };
 
