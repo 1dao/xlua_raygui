@@ -43,16 +43,11 @@
 // DrawText…），故手工声明所需函数（user32/kernel32，MinGW 默认链接）。
 #if defined(_WIN32)
 typedef struct { long x, y; } xr_point;
-typedef struct {
-    unsigned long size, flags;
-    void *cursor;
-    xr_point position;
-} xr_cursor_info;
-__declspec(dllimport) int __stdcall GetCursorInfo(xr_cursor_info *info);
-__declspec(dllimport) void * __stdcall GetForegroundWindow(void);
-__declspec(dllimport) void * __stdcall WindowFromPoint(xr_point point);
-__declspec(dllimport) void * __stdcall LoadCursorW(void *instance, const unsigned short *name);
-__declspec(dllimport) void * __stdcall SetCursor(void *cursor);
+typedef struct { long left, top, right, bottom; } xr_rect;
+typedef struct { unsigned long size; xr_rect monitor, work; unsigned long flags; } xr_monitor_info;
+__declspec(dllimport) void * __stdcall MonitorFromWindow(void *window, unsigned long flags);
+__declspec(dllimport) int __stdcall GetMonitorInfoW(void *monitor, xr_monitor_info *info);
+__declspec(dllimport) int __stdcall SetWindowPos(void *window, void *after, int x, int y, int w, int h, unsigned int flags);
 __declspec(dllimport) int __stdcall IsClipboardFormatAvailable(unsigned int format);
 __declspec(dllimport) int __stdcall OpenClipboard(void *hWndNewOwner);
 __declspec(dllimport) int __stdcall CloseClipboard(void);
@@ -78,6 +73,7 @@ static int clipboard_has_image(void) { return 0; }
 // textbox_multi 编辑态里按 Ctrl+V 而剪贴板是图片（无文本）时置位；
 // Lua 侧每帧用 take_pasted_image() 轮询取走（取走即清零）。
 static int g_image_pasted = 0;
+static bool g_desktop_maximize = false;
 
 #define TEXT_BUF_SINGLE  4096
 #define TEXT_BUF_MULTI   16384
@@ -1220,9 +1216,13 @@ static int l_init(lua_State *L) {
     // script then draws its own minimize / maximize / close and handles move
     // and edge-resize itself (window_pos / set_window_pos / set_window_size).
     unsigned int flags = FLAG_WINDOW_RESIZABLE;
+    g_desktop_maximize = false;
     if (lua_istable(L, 4)) {
         lua_getfield(L, 4, "undecorated");
         if (lua_toboolean(L, -1)) flags |= FLAG_WINDOW_UNDECORATED;
+        lua_pop(L, 1);
+        lua_getfield(L, 4, "desktop_maximize");
+        g_desktop_maximize = lua_toboolean(L, -1);
         lua_pop(L, 1);
     }
     // Resizable window: without this flag raylib/GLFW disables (greys out) the
@@ -1261,29 +1261,7 @@ static int l_should_close(lua_State *L) {
 // 用于跨帧追踪鼠标是否悬停在任意交互 UI 领空内
 static bool g_mouse_over_ui_current = false;
 static bool g_mouse_over_ui_last    = false;
-static int g_mouse_cursor = MOUSE_CURSOR_DEFAULT;
 static unsigned long long g_ui_frame = 0;
-
-// Borderless maximize can leave the native cursor unset although raylib still
-// considers it visible. Repair the actual OS cursor after event processing;
-// never touch another window's pointer or an intentionally hidden cursor.
-static void restore_native_cursor(void) {
-#if defined(_WIN32)
-    void *window = GetWindowHandle();
-    xr_cursor_info info = {0};
-    info.size = sizeof(info);
-    if (IsCursorHidden() || GetForegroundWindow() != window ||
-        !GetCursorInfo(&info) || WindowFromPoint(info.position) != window) return;
-    if ((info.flags & 1) && info.cursor) return;
-    static const unsigned short ids[] = {
-        32512, 32512, 32513, 32515, 32649, 32644, 32645, 32642, 32643, 32646, 32648
-    };
-    int shape = g_mouse_cursor;
-    if (shape < 0 || shape >= (int)(sizeof(ids) / sizeof(ids[0]))) shape = 0;
-    void *cursor = LoadCursorW(NULL, (const unsigned short *)(uintptr_t)ids[shape]);
-    if (cursor) SetCursor(cursor);
-#endif
-}
 
 static int l_begin(lua_State *L) {
     (void)L;
@@ -1300,7 +1278,6 @@ static int l_begin(lua_State *L) {
 static int l_finish(lua_State *L) {
     (void)L;
     EndDrawing();
-    restore_native_cursor();
     return 0;
 }
 
@@ -2280,7 +2257,11 @@ static int l_set_window_pos(lua_State *L) {
 
 // set_window_size(w, h)
 static int l_set_window_size(lua_State *L) {
-    SetWindowSize((int)luaL_checknumber(L, 1), (int)luaL_checknumber(L, 2));
+    int width = (int)luaL_checknumber(L, 1);
+    int height = (int)luaL_checknumber(L, 2);
+    // A stale custom-border drag must not shrink a maximized window while
+    // Windows/GLFW still considers it maximized. Restore explicitly first.
+    if (!IsWindowMaximized()) SetWindowSize(width, height);
     return 0;
 }
 
@@ -2308,7 +2289,28 @@ static int l_mouse_screen(lua_State *L) {
 }
 
 static int l_minimize_window(lua_State *L) { (void)L; MinimizeWindow(); return 0; }
-static int l_maximize_window(lua_State *L) { (void)L; MaximizeWindow(); return 0; }
+static int l_maximize_window(lua_State *L) {
+    (void)L;
+    MaximizeWindow();
+#if defined(_WIN32)
+    // An undecorated popup covering the exact monitor rectangle can enter
+    // the graphics driver's fullscreen/overlay path. Keep desktop maximization
+    // in the work area, with a 2px reveal strip when auto-hide makes it fullscreen.
+    if (g_desktop_maximize) {
+        void *window = GetWindowHandle();
+        xr_monitor_info info = {0};
+        info.size = sizeof(info);
+        if (GetMonitorInfoW(MonitorFromWindow(window, 2), &info) &&
+            info.work.left == info.monitor.left && info.work.top == info.monitor.top &&
+            info.work.right == info.monitor.right && info.work.bottom == info.monitor.bottom) {
+            SetWindowPos(window, NULL, info.work.left, info.work.top,
+                info.work.right - info.work.left, info.work.bottom - info.work.top - 2,
+                0x0004 | 0x0010 | 0x0200); // no Z-order, activation or owner changes
+        }
+    }
+#endif
+    return 0;
+}
 static int l_restore_window(lua_State *L)  { (void)L; RestoreWindow();  return 0; }
 
 static int l_is_window_maximized(lua_State *L) {
@@ -2319,8 +2321,7 @@ static int l_is_window_maximized(lua_State *L) {
 // set_mouse_cursor(n): raylib MouseCursor (0 default, 5 resize E-W, 6 resize
 // N-S, 7 resize NW-SE, 8 resize NE-SW).
 static int l_set_mouse_cursor(lua_State *L) {
-    g_mouse_cursor = (int)luaL_checkinteger(L, 1);
-    SetMouseCursor(g_mouse_cursor);
+    SetMouseCursor((int)luaL_checkinteger(L, 1));
     return 0;
 }
 
