@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "caret_blink.h"
 
 #include "lua.h"
 #include "lualib.h"
@@ -41,6 +42,17 @@
 // 文本格式，没有就静默跳过。windows.h 与 raylib 符号冲突（Rectangle/CloseWindow/
 // DrawText…），故手工声明所需函数（user32/kernel32，MinGW 默认链接）。
 #if defined(_WIN32)
+typedef struct { long x, y; } xr_point;
+typedef struct {
+    unsigned long size, flags;
+    void *cursor;
+    xr_point position;
+} xr_cursor_info;
+__declspec(dllimport) int __stdcall GetCursorInfo(xr_cursor_info *info);
+__declspec(dllimport) void * __stdcall GetForegroundWindow(void);
+__declspec(dllimport) void * __stdcall WindowFromPoint(xr_point point);
+__declspec(dllimport) void * __stdcall LoadCursorW(void *instance, const unsigned short *name);
+__declspec(dllimport) void * __stdcall SetCursor(void *cursor);
 __declspec(dllimport) int __stdcall IsClipboardFormatAvailable(unsigned int format);
 __declspec(dllimport) int __stdcall OpenClipboard(void *hWndNewOwner);
 __declspec(dllimport) int __stdcall CloseClipboard(void);
@@ -1249,8 +1261,33 @@ static int l_should_close(lua_State *L) {
 // 用于跨帧追踪鼠标是否悬停在任意交互 UI 领空内
 static bool g_mouse_over_ui_current = false;
 static bool g_mouse_over_ui_last    = false;
+static int g_mouse_cursor = MOUSE_CURSOR_DEFAULT;
+static unsigned long long g_ui_frame = 0;
+
+// Borderless maximize can leave the native cursor unset although raylib still
+// considers it visible. Repair the actual OS cursor after event processing;
+// never touch another window's pointer or an intentionally hidden cursor.
+static void restore_native_cursor(void) {
+#if defined(_WIN32)
+    void *window = GetWindowHandle();
+    xr_cursor_info info = {0};
+    info.size = sizeof(info);
+    if (IsCursorHidden() || GetForegroundWindow() != window ||
+        !GetCursorInfo(&info) || WindowFromPoint(info.position) != window) return;
+    if ((info.flags & 1) && info.cursor) return;
+    static const unsigned short ids[] = {
+        32512, 32512, 32513, 32515, 32649, 32644, 32645, 32642, 32643, 32646, 32648
+    };
+    int shape = g_mouse_cursor;
+    if (shape < 0 || shape >= (int)(sizeof(ids) / sizeof(ids[0]))) shape = 0;
+    void *cursor = LoadCursorW(NULL, (const unsigned short *)(uintptr_t)ids[shape]);
+    if (cursor) SetCursor(cursor);
+#endif
+}
+
 static int l_begin(lua_State *L) {
     (void)L;
+    g_ui_frame++;
     g_mouse_over_ui_last = g_mouse_over_ui_current;
     g_mouse_over_ui_current = false;
     
@@ -1263,6 +1300,7 @@ static int l_begin(lua_State *L) {
 static int l_finish(lua_State *L) {
     (void)L;
     EndDrawing();
+    restore_native_cursor();
     return 0;
 }
 
@@ -1332,6 +1370,17 @@ static int g_cursor_single = 0;
 static int g_cursor_multi  = 0;
 static int g_scroll_multi  = 0;   // 多行框纵向滚动（以"行"为单位）
 static int g_sel_anchor    = -1;  // 多行框选区锚点（-1=无选区；否则与光标构成选区）
+static xr_caret_blink g_caret_single = { .restart = true };
+static xr_caret_blink g_caret_multi = { .restart = true };
+
+static bool textbox_caret_visible(xr_caret_blink *state, Rectangle r,
+    int cursor, int length, int selection, bool typed) {
+    if (!IsWindowFocused()) return false;
+    bool clicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
+        CheckCollisionPointRec(GetMousePosition(), r);
+    return xr_caret_visible(state, GetTime(), g_ui_frame, r.x, r.y, r.width, r.height,
+        cursor, length, selection, typed || clicked);
+}
 
 // 首次按下 + 长按时的系统级自动重复（退格/删除/方向键长按可连续触发）
 static bool key_repeat(int key) {
@@ -1342,6 +1391,7 @@ static int l_textbox(lua_State *L) {
     Rectangle r = {lua_tonumber(L,1), lua_tonumber(L,2), lua_tonumber(L,3), lua_tonumber(L,4)};
     const char *text_from_lua = luaL_checkstring(L, 5);
     bool editMode = lua_toboolean(L, 6);
+    bool typed = false;
 
     strncpy(g_buf_single, text_from_lua, TEXT_BUF_SINGLE-1);
     g_buf_single[TEXT_BUF_SINGLE - 1] = '\0';
@@ -1384,6 +1434,7 @@ static int l_textbox(lua_State *L) {
         // A. 捕获键盘流及中文 IME 输入，并精准插入到当前光标所在位置
         int cp;
         while ((cp = GetCharPressed()) > 0) {
+            typed = true;
             char utf8[5] = {0};
             int bytes = 0;
             if (cp < 0x80) { utf8[0] = cp; bytes = 1; }
@@ -1468,7 +1519,8 @@ static int l_textbox(lua_State *L) {
     // 4. 自主绘制唯一样式完美的高亮激活框与随动光标
     if (editMode) {
         Color activeColor = GetColor(GuiGetStyle(TEXTBOX, BORDER_COLOR_FOCUSED));
-        DrawRectangleLinesEx(r, 1, activeColor);
+        int border = GuiGetStyle(TEXTBOX, BORDER_WIDTH);
+        if (border > 0) DrawRectangleLinesEx(r, border, activeColor);
 
         // 完美测算从开头到当前光标处的子字符串的像素实际宽度
         char tmp[TEXT_BUF_SINGLE];
@@ -1483,11 +1535,12 @@ static int l_textbox(lua_State *L) {
         float cursor_x = r.x + padding + textSize.x + 2;
         float cursor_y = r.y + r.height/2;
 
-        if (cursor_x < r.x + r.width - padding) {
+        if (textbox_caret_visible(&g_caret_single, r, g_cursor_single, len, -1, typed) &&
+            cursor_x < r.x + r.width - padding) {
             DrawLineV(
                 (Vector2){ cursor_x, cursor_y - fontSize/2 },
                 (Vector2){ cursor_x, cursor_y + fontSize/2 },
-                activeColor
+                GetColor(GuiGetStyle(TEXTBOX, TEXT_COLOR_FOCUSED))
             );
         }
     }
@@ -1562,6 +1615,7 @@ static int l_textbox_multi(lua_State *L) {
     bool editMode = lua_toboolean(L, 6);
     bool enter_submits = lua_toboolean(L, 7);   // optional: Enter=submit, Ctrl+Enter=newline
     bool submitted = false;
+    bool typed = false;
 
     strncpy(g_buf_multi, text_from_lua, TEXT_BUF_MULTI-1);
     g_buf_multi[TEXT_BUF_MULTI - 1] = '\0';
@@ -1630,6 +1684,7 @@ static int l_textbox_multi(lua_State *L) {
         // A. 捕获常规打字及多汉字 IME 确认输入，中途插入到光标所在处
         int cp;
         while ((cp = GetCharPressed()) > 0) {
+            typed = true;
             if (ctrl) continue;                     // Ctrl 组合不当字符输入
             if (tbm_has_sel()) tbm_del_sel(&len);   // 有选区：先删除选区
             char utf8[5] = {0};
@@ -1846,8 +1901,9 @@ static int l_textbox_multi(lua_State *L) {
             }
         }
 
-        // 光标（跟随滚动）
-        if (editMode) {
+        // The caret blinks independently of the focus border and selection.
+        if (editMode && textbox_caret_visible(&g_caret_multi, r,
+            g_cursor_multi, len, g_sel_anchor, typed)) {
             char cur_sub[TEXT_BUF_MULTI];
             int sub_len = g_cursor_multi - current_line_start;
             if (sub_len < 0) sub_len = 0;
@@ -1857,14 +1913,14 @@ static int l_textbox_multi(lua_State *L) {
             float cx = r.x + padding + sz.x + 1;
             float cy = r.y + padding + (cursor_line - g_scroll_multi) * lineH;
             DrawLineV((Vector2){ cx, cy }, (Vector2){ cx, cy + fontSize },
-                      GetColor(GuiGetStyle(TEXTBOX, BORDER_COLOR_FOCUSED)));
+                      GetColor(GuiGetStyle(TEXTBOX, TEXT_COLOR_FOCUSED)));
         }
     }
     EndScissorMode();
 
     // 聚焦高亮外框
-    if (editMode) {
-        DrawRectangleLinesEx(r, 1, GetColor(GuiGetStyle(TEXTBOX, BORDER_COLOR_FOCUSED)));
+    if (editMode && GuiGetStyle(TEXTBOX, BORDER_WIDTH) > 0) {
+        DrawRectangleLinesEx(r, GuiGetStyle(TEXTBOX, BORDER_WIDTH), GetColor(GuiGetStyle(TEXTBOX, BORDER_COLOR_FOCUSED)));
     }
 
     lua_pushstring(L, g_buf_multi);
@@ -2187,6 +2243,7 @@ static int l_is_key_pressed(lua_State *L) {
 // with a completion, this drops the caret at the end (otherwise it would keep
 // its stale byte offset and the next keystroke would insert mid-text).
 static int l_set_textbox_cursor(lua_State *L) {
+    g_caret_multi.restart = true;
     int pos = (int)luaL_checkinteger(L, 1);
     if (pos < 0) pos = 0;
     g_cursor_multi = pos;
@@ -2233,7 +2290,6 @@ static int l_set_window_size(lua_State *L) {
 // drag built on it jitters. Windows asks the OS directly (user32 is already
 // linked; hand-declared because windows.h clashes with raylib's names).
 #if defined(_WIN32)
-typedef struct { long x, y; } xr_point;
 __declspec(dllimport) int __stdcall GetCursorPos(xr_point *p);
 #endif
 static int l_mouse_screen(lua_State *L) {
@@ -2263,7 +2319,8 @@ static int l_is_window_maximized(lua_State *L) {
 // set_mouse_cursor(n): raylib MouseCursor (0 default, 5 resize E-W, 6 resize
 // N-S, 7 resize NW-SE, 8 resize NE-SW).
 static int l_set_mouse_cursor(lua_State *L) {
-    SetMouseCursor((int)luaL_checkinteger(L, 1));
+    g_mouse_cursor = (int)luaL_checkinteger(L, 1);
+    SetMouseCursor(g_mouse_cursor);
     return 0;
 }
 
