@@ -4,10 +4,10 @@
 *
 *   MODULE USAGE:
 *       #define GUI_WINDOW_FILE_DIALOG_IMPLEMENTATION
-*       #include "gui_window_file_dialog.h"
+*       #include "file_dialog.h"
 *
-*       INIT: GuiWindowFileDialogState state = GuiInitWindowFileDialog();
-*       DRAW: GuiWindowFileDialog(&state);
+*       INIT: GuiWindowFileDialogState state = file_dialog_init();
+*       DRAW: file_dialog_draw(&state);
 *
 *   NOTE: This module depends on some raylib file system functions:
 *       - LoadDirectoryFiles()
@@ -101,8 +101,8 @@ extern "C" {            // Prevents name mangling of functions
 //----------------------------------------------------------------------------------
 // Module Functions Declaration
 //----------------------------------------------------------------------------------
-GuiWindowFileDialogState InitGuiWindowFileDialog(const char *initPath);
-void GuiWindowFileDialog(GuiWindowFileDialogState *state);
+GuiWindowFileDialogState file_dialog_init(const char *initPath);
+void file_dialog_draw(GuiWindowFileDialogState *state);
 
 #ifdef __cplusplus
 }
@@ -160,21 +160,56 @@ typedef char *FileInfo;             // Files are just a path string
 //----------------------------------------------------------------------------------
 FileInfo *dirFilesIcon = NULL;      // Path string + icon (for fancy drawing)
 
+// PATCH(xlua_raygui): code-drawn color icons, without additional image assets.
+static int fileDialogIconKinds[MAX_DIRECTORY_FILES];
+
+static void file_dialog_draw_icon(int kind, int x, int y)
+{
+    if (kind == 1) {
+        DrawRectangleRounded((Rectangle){x, y + 2, 7, 5}, 0.4f, 4, (Color){202,143,42,255});
+        DrawRectangleRounded((Rectangle){x, y + 5, 16, 10}, 0.3f, 4, (Color){202,143,42,255});
+        DrawRectangleRounded((Rectangle){x + 1, y + 7, 14, 8}, 0.3f, 4, (Color){246,193,83,255});
+        DrawRectangle(x + 2, y + 7, 12, 1, (Color){255,219,137,255});
+    } else {
+        Color color = (Color){76,132,210,255};
+        if (kind == 12) color = (Color){53,157,115,255};
+        else if (kind == 11) color = (Color){155,104,195,255};
+        else if (kind == 200) color = (Color){106,123,146,255};
+        else if (kind == 218) color = (Color){128,144,164,255};
+        GuiDrawIcon(kind, x, y, 1, color);
+    }
+}
+
+static void file_dialog_tooltip(Rectangle bounds, const char *text)
+{
+    if (!CheckCollisionPointRec(GetMousePosition(), bounds)) return;
+    int size = GuiGetStyle(DEFAULT, TEXT_SIZE);
+    Color ink = GetColor(GuiGetStyle(DEFAULT, TEXT_COLOR_NORMAL));
+    float width = MeasureTextEx(GuiGetFont(), text, size, GuiGetStyle(DEFAULT, TEXT_SPACING)).x + 16;
+    float x = bounds.x + bounds.width - width, y = bounds.y + bounds.height + 5;
+    if (x < 4) x = 4;
+    if (y + size + 12 > GetScreenHeight()) y = bounds.y - size - 17;
+    DrawRectangleRounded((Rectangle){x - 1, y - 1, width + 2, size + 14}, 0.2f, 4, ink);
+    DrawRectangleRounded((Rectangle){x, y, width, size + 12}, 0.2f, 4,
+        GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
+    DrawTextEx(GuiGetFont(), text, (Vector2){x + 8, y + 6}, size, GuiGetStyle(DEFAULT, TEXT_SPACING), ink);
+}
+
 //----------------------------------------------------------------------------------
 // Internal Module Functions Definition
 //----------------------------------------------------------------------------------
 // Read files in new path
-static void ReloadDirectoryFiles(GuiWindowFileDialogState *state);
+static void file_dialog_reload(GuiWindowFileDialogState *state);
 
 #if defined(USE_CUSTOM_LISTVIEW_FILEINFO)
 // List View control for files info with extended parameters
-static int GuiListViewFiles(Rectangle bounds, FileInfo *files, int count, int *focus, int *scrollIndex, int active);
+static int file_dialog_list_view(Rectangle bounds, FileInfo *files, int count, int *focus, int *scrollIndex, int active);
 #endif
 
 //----------------------------------------------------------------------------------
 // Module Functions Definition
 //----------------------------------------------------------------------------------
-GuiWindowFileDialogState InitGuiWindowFileDialog(const char *initPath)
+GuiWindowFileDialogState file_dialog_init(const char *initPath)
 {
     GuiWindowFileDialogState state = { 0 };
 
@@ -225,7 +260,7 @@ GuiWindowFileDialogState InitGuiWindowFileDialog(const char *initPath)
 }
 
 // Update and draw file dialog
-void GuiWindowFileDialog(GuiWindowFileDialogState *state)
+void file_dialog_draw(GuiWindowFileDialogState *state)
 {
     if (state->windowActive)
     {
@@ -273,15 +308,17 @@ void GuiWindowFileDialog(GuiWindowFileDialogState *state)
         }
 
         // Load current directory files
-        if (state->dirFiles.paths == NULL) ReloadDirectoryFiles(state);
+        if (state->dirFiles.paths == NULL) file_dialog_reload(state);
         //----------------------------------------------------------------------------------------
 
         // Draw window and controls
         //----------------------------------------------------------------------------------------
-        state->windowActive = !GuiWindowBox(state->windowBounds, "#198# Select File Dialog");
+        state->windowActive = !GuiWindowBox(state->windowBounds, "Select File Dialog");
+        Rectangle upBounds = { state->windowBounds.x + state->windowBounds.width - 48, state->windowBounds.y + 36, 40, 24 };
+        Rectangle selectBounds = { state->windowBounds.x + state->windowBounds.width - 40, state->windowBounds.y + state->windowBounds.height - 68, 32, 24 };
 
         // Draw previous directory button + logic
-        if (GuiButton((Rectangle){ state->windowBounds.x + state->windowBounds.width - 48, state->windowBounds.y + 24 + 12, 40, 24 }, "< .."))
+        if (GuiButton(upBounds, ""))
         {
 #if defined(_WIN32)
             // PATCH(xlua_raygui): at a drive root ("C:\") going up shows the
@@ -299,12 +336,18 @@ void GuiWindowFileDialog(GuiWindowFileDialogState *state)
 #endif
 
             // Reload directory files (frees previous list)
-            ReloadDirectoryFiles(state);
+            file_dialog_reload(state);
 
             state->filesListActive = -1;
             memset(state->fileNameText, 0, 1024);
             memset(state->fileNameTextCopy, 0, 1024);
         }
+
+        int ux = (int)(upBounds.x + upBounds.width/2), uy = (int)upBounds.y + 6;
+        Color navigationColor = (Color){64,132,235,255};
+        DrawLineEx((Vector2){ux, uy + 12}, (Vector2){ux, uy}, 2, navigationColor);
+        DrawLineEx((Vector2){ux - 5, uy + 5}, (Vector2){ux, uy}, 2, navigationColor);
+        DrawLineEx((Vector2){ux + 5, uy + 5}, (Vector2){ux, uy}, 2, navigationColor);
 
         // Draw current directory text box info + path editing logic
         if (GuiTextBox((Rectangle){ state->windowBounds.x + 8, state->windowBounds.y + 24 + 12, state->windowBounds.width - 48 - 16, 24 }, state->dirPathText, 1024, state->dirPathEditMode))
@@ -315,7 +358,7 @@ void GuiWindowFileDialog(GuiWindowFileDialogState *state)
                 if (DirectoryExists(state->dirPathText))
                 {
                     // Reload directory files (frees previous list)
-                    ReloadDirectoryFiles(state);
+                    file_dialog_reload(state);
 
                     strcpy(state->dirPathTextCopy, state->dirPathText);
                 }
@@ -331,10 +374,35 @@ void GuiWindowFileDialog(GuiWindowFileDialogState *state)
         GuiSetStyle(LISTVIEW, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
         GuiSetStyle(LISTVIEW, LIST_ITEMS_HEIGHT, 24);
 # if defined(USE_CUSTOM_LISTVIEW_FILEINFO)
-        state->filesListActive = GuiListViewFiles((Rectangle){ state->position.x + 8, state->position.y + 48 + 20, state->windowBounds.width - 16, state->windowBounds.height - 60 - 16 - 68 }, fileInfo, state->dirFiles.count, &state->itemFocused, &state->filesListScrollIndex, state->filesListActive);
+        state->filesListActive = file_dialog_list_view((Rectangle){ state->position.x + 8, state->position.y + 48 + 20, state->windowBounds.width - 16, state->windowBounds.height - 60 - 16 - 68 }, fileInfo, state->dirFiles.count, &state->itemFocused, &state->filesListScrollIndex, state->filesListActive);
 # else
-        GuiListViewEx((Rectangle){ state->windowBounds.x + 8, state->windowBounds.y + 48 + 20, state->windowBounds.width - 16, state->windowBounds.height - 60 - 16 - 68 }, 
-                      (char**)dirFilesIcon, state->dirFiles.count, &state->filesListScrollIndex, &state->filesListActive, &state->itemFocused);
+        Rectangle listBounds = { state->windowBounds.x + 8, state->windowBounds.y + 68,
+            state->windowBounds.width - 16, state->windowBounds.height - 144 };
+        int step = 24 + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING);
+        int visible = (int)listBounds.height/step;
+        if (visible > (int)state->dirFiles.count) visible = state->dirFiles.count;
+        int maxScroll = (int)state->dirFiles.count - visible;
+        int drawnStart = state->filesListScrollIndex;
+        if (drawnStart < 0 || drawnStart > maxScroll) drawnStart = 0;
+        // ListView applies the wheel before painting, but scrollbar drags after
+        // painting. Preserve the painted range so icons never lag the filenames.
+        if (GuiGetState() != STATE_DISABLED && !guiLocked && !guiControlExclusiveMode &&
+            CheckCollisionPointRec(GetMousePosition(), listBounds) &&
+            step * (int)state->dirFiles.count > listBounds.height) {
+            drawnStart -= (int)GUI_SCROLL_DELTA;
+            if (drawnStart < 0) drawnStart = 0;
+            if (drawnStart > maxScroll) drawnStart = maxScroll;
+        }
+        GuiListViewEx(listBounds, (char**)dirFilesIcon, state->dirFiles.count,
+            &state->filesListScrollIndex, &state->filesListActive, &state->itemFocused);
+        Rectangle itemBounds = {listBounds.x + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING),
+            listBounds.y + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING) + GuiGetStyle(DEFAULT, BORDER_WIDTH), 40, 24};
+        for (int i = 0; i < visible; i++) {
+            Rectangle textBounds = GetTextBounds(LISTVIEW, itemBounds);
+            file_dialog_draw_icon(fileDialogIconKinds[drawnStart + i], (int)textBounds.x,
+                (int)(textBounds.y + textBounds.height/2 - 8 + (int)textBounds.height%2));
+            itemBounds.y += step;
+        }
 # endif
         GuiSetStyle(LISTVIEW, TEXT_ALIGNMENT, prevTextAlignment);
         GuiSetStyle(LISTVIEW, LIST_ITEMS_HEIGHT, prevElementsHeight);
@@ -352,7 +420,7 @@ void GuiWindowFileDialog(GuiWindowFileDialogState *state)
             {
                 strcpy(state->dirPathText, TextFormat("%s\\", state->fileNameText));
                 strcpy(state->dirPathTextCopy, state->dirPathText);
-                ReloadDirectoryFiles(state);
+                file_dialog_reload(state);
                 state->filesListActive = -1;
                 strcpy(state->fileNameText, "\0");
                 strcpy(state->fileNameTextCopy, state->fileNameText);
@@ -367,7 +435,7 @@ void GuiWindowFileDialog(GuiWindowFileDialogState *state)
                 strcpy(state->dirPathTextCopy, state->dirPathText);
 
                 // Reload directory files (frees previous list)
-                ReloadDirectoryFiles(state);
+                file_dialog_reload(state);
 
                 strcpy(state->dirPathTextCopy, state->dirPathText);
 
@@ -412,9 +480,14 @@ void GuiWindowFileDialog(GuiWindowFileDialogState *state)
         GuiLabel((Rectangle){ state->windowBounds.x + 8, state->windowBounds.y + state->windowBounds.height - 24 - 12, 68, 24 }, "File filter:");
         GuiComboBox((Rectangle){ state->windowBounds.x + 72, state->windowBounds.y + state->windowBounds.height - 24 - 12, state->windowBounds.width - 184, 24 }, "All files", &state->fileTypeActive);
 
-        state->SelectFilePressed = GuiButton((Rectangle){ state->windowBounds.x + state->windowBounds.width - 96 - 8, state->windowBounds.y + state->windowBounds.height - 68, 96, 24 }, "Select");
+        state->SelectFilePressed = GuiButton(selectBounds, "");
+        int sx = (int)selectBounds.x + 8, sy = (int)selectBounds.y + 4;
+        file_dialog_draw_icon(1, sx, sy);
+        DrawLineEx((Vector2){sx + 7, sy + 10}, (Vector2){sx + 10, sy + 13}, 2, (Color){37,91,176,255});
+        DrawLineEx((Vector2){sx + 10, sy + 13}, (Vector2){sx + 16, sy + 6}, 2, (Color){37,91,176,255});
+        file_dialog_tooltip(upBounds, "上一级");
+        file_dialog_tooltip(selectBounds, "选择");
 
-        if (GuiButton((Rectangle){ state->windowBounds.x + state->windowBounds.width - 96 - 8, state->windowBounds.y + state->windowBounds.height - 24 - 12, 96, 24 }, "Cancel")) state->windowActive = false;
         //--------------------------------------------------------------------------------------
 
         // Exit on file selected
@@ -440,7 +513,7 @@ void GuiWindowFileDialog(GuiWindowFileDialogState *state)
 }
 
 // Compare two files from a directory
-static inline int FileCompare(const char *d1, const char *d2, const char *dir)
+static inline int file_dialog_compare(const char *d1, const char *d2, const char *dir)
 {
     const bool b1 = DirectoryExists(TextFormat("%s/%s", dir, d1));
     const bool b2 = DirectoryExists(TextFormat("%s/%s", dir, d2));
@@ -455,7 +528,7 @@ static inline int FileCompare(const char *d1, const char *d2, const char *dir)
 }
 
 // Read files in new path
-static void ReloadDirectoryFiles(GuiWindowFileDialogState *state)
+static void file_dialog_reload(GuiWindowFileDialogState *state)
 {
     UnloadDirectoryFiles(state->dirFiles);
 
@@ -495,41 +568,25 @@ static void ReloadDirectoryFiles(GuiWindowFileDialogState *state)
     // Reset dirFilesIcon memory
     for (int i = 0; i < MAX_DIRECTORY_FILES; i++) memset(dirFilesIcon[i], 0, MAX_ICON_PATH_LENGTH);
 
-    // Copy paths as icon + fileNames into dirFilesIcon
+    // Reserve the standard icon column; the list paints its colored icon there.
     for (unsigned int i = 0; i < state->dirFiles.count; i++)
     {
-        if (IsPathFile(state->dirFiles.paths[i]))
-        {
-            // Path is a file, a file icon for convenience (for some recognized extensions)
-            if (IsFileExtension(state->dirFiles.paths[i], ".png;.bmp;.tga;.gif;.jpg;.jpeg;.psd;.hdr;.qoi;.dds;.pkm;.ktx;.pvr;.astc"))
-            {
-                strcpy(dirFilesIcon[i], TextFormat("#12#%s", GetFileName(state->dirFiles.paths[i])));
-            }
-            else if (IsFileExtension(state->dirFiles.paths[i], ".wav;.mp3;.ogg;.flac;.xm;.mod;.it;.wma;.aiff"))
-            {
-                strcpy(dirFilesIcon[i], TextFormat("#11#%s", GetFileName(state->dirFiles.paths[i])));
-            }
-            else if (IsFileExtension(state->dirFiles.paths[i], ".txt;.info;.md;.nfo;.xml;.json;.c;.cpp;.cs;.lua;.py;.glsl;.vs;.fs"))
-            {
-                strcpy(dirFilesIcon[i], TextFormat("#10#%s", GetFileName(state->dirFiles.paths[i])));
-            }
-            else if (IsFileExtension(state->dirFiles.paths[i], ".exe;.bin;.raw;.msi"))
-            {
-                strcpy(dirFilesIcon[i], TextFormat("#200#%s", GetFileName(state->dirFiles.paths[i])));
-            }
-            else strcpy(dirFilesIcon[i], TextFormat("#218#%s", GetFileName(state->dirFiles.paths[i])));
+        int kind = 1;
+        if (IsPathFile(state->dirFiles.paths[i])) {
+            kind = 218;
+            if (IsFileExtension(state->dirFiles.paths[i], ".png;.bmp;.tga;.gif;.jpg;.jpeg;.psd;.hdr;.qoi;.dds;.pkm;.ktx;.pvr;.astc")) kind = 12;
+            else if (IsFileExtension(state->dirFiles.paths[i], ".wav;.mp3;.ogg;.flac;.xm;.mod;.it;.wma;.aiff")) kind = 11;
+            else if (IsFileExtension(state->dirFiles.paths[i], ".txt;.info;.md;.nfo;.xml;.json;.c;.cpp;.cs;.lua;.py;.glsl;.vs;.fs")) kind = 10;
+            else if (IsFileExtension(state->dirFiles.paths[i], ".exe;.bin;.raw;.msi")) kind = 200;
         }
-        else
-        {
-            // Path is a directory, add a directory icon
-            strcpy(dirFilesIcon[i], TextFormat("#1#%s", GetFileName(state->dirFiles.paths[i])));
-        }
+        fileDialogIconKinds[i] = kind;
+        strcpy(dirFilesIcon[i], TextFormat("#0#%s", GetFileName(state->dirFiles.paths[i])));
     }
 }
 
 #if defined(USE_CUSTOM_LISTVIEW_FILEINFO)
 // List View control for files info with extended parameters
-static int GuiListViewFiles(Rectangle bounds, FileInfo *files, int count, int *focus, int *scrollIndex, int *active)
+static int file_dialog_list_view(Rectangle bounds, FileInfo *files, int count, int *focus, int *scrollIndex, int *active)
 {
     int result = 0;
     GuiState state = guiState;

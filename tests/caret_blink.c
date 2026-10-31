@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
-#include "../caret_blink.h"
+// Exercise the internal helper without adding a public API or a tiny header.
+#include "../lua_raygui.c"
 
 static bool tick(xr_caret_blink *s, double time, unsigned long long frame) {
     return xr_caret_visible(s, time, frame, 10, 20, 300, 80, 0, 0, -1, false);

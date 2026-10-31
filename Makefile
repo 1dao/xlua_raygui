@@ -69,7 +69,7 @@ endif
 # ============================================================================
 all: $(TARGET)
 
-$(TARGET): lua_raygui.c caret_blink.h
+$(TARGET): lua_raygui.c file_dialog.h
 	$(CC) $(SHARED) $(CFLAGS) $(INCLUDES) -o $@ lua_raygui.c $(LIBS) $(LDFLAGS)
 
 # 清理编译产物

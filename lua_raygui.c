@@ -23,14 +23,13 @@
 // ../raygui/examples/custom_file_dialog/，include 路径已修）。
 // 立即模式浮窗：file_dialog_open() 打开，每帧 file_dialog() 绘制并取状态。
 #define GUI_WINDOW_FILE_DIALOG_IMPLEMENTATION
-#include "gui_window_file_dialog.h"
+#include "file_dialog.h"
 
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "caret_blink.h"
 
 #include "lua.h"
 #include "lualib.h"
@@ -1341,6 +1340,34 @@ static int l_progressbar(lua_State *L) {
 }
 
 //============================================================================
+// 独立功能：输入光标闪烁（纯状态与计时逻辑，不依赖 Lua 和绘制控件）
+//============================================================================
+typedef struct {
+    double started;
+    unsigned long long frame;
+    float x, y, width, height;
+    int cursor, length, selection;
+    bool restart;
+} xr_caret_blink;
+
+// Only the focused control calls this function. Unfocused controls must not
+// reset another field's timer when a form draws several textboxes per frame.
+static bool xr_caret_visible(xr_caret_blink *state, double now,
+    unsigned long long frame, float x, float y, float width, float height,
+    int cursor, int length, int selection, bool activity) {
+    bool reset = state->restart || now < state->started || state->frame + 1 != frame ||
+        state->x != x || state->y != y || state->width != width || state->height != height ||
+        state->cursor != cursor || state->length != length || state->selection != selection || activity;
+    if (reset) state->started = now;
+    state->restart = false;
+    state->frame = frame;
+    state->x = x; state->y = y; state->width = width; state->height = height;
+    state->cursor = cursor; state->length = length; state->selection = selection;
+    // A full cycle is one second: visible for 500ms, hidden for 500ms.
+    return fmod(now - state->started, 1.0) < 0.5;
+}
+
+//============================================================================
 // 基础控件 - 单行输入框（双返回值，全接管，完美中途插入与单光标移动）
 //============================================================================
 static int g_cursor_single = 0;
@@ -2347,7 +2374,7 @@ static int l_file_dialog_open(lua_State *L) {
     int w = (int)luaL_optinteger(L, 2, 560);
     int h = (int)luaL_optinteger(L, 3, 420);
     int dirs_only = lua_toboolean(L, 4);
-    g_file_dialog = InitGuiWindowFileDialog(path);
+    g_file_dialog = file_dialog_init(path);
     g_file_dialog.windowBounds = (Rectangle){
         (float)(GetScreenWidth() / 2 - w / 2), (float)(GetScreenHeight() / 2 - h / 2),
         (float)w, (float)h };
@@ -2362,7 +2389,7 @@ static int l_file_dialog_open(lua_State *L) {
 // 文件名（目录选择场景忽略 file、直接用 dir）。
 static int l_file_dialog(lua_State *L) {
     if (!g_file_dialog_live) { lua_pushnil(L); return 1; }
-    GuiWindowFileDialog(&g_file_dialog);
+    file_dialog_draw(&g_file_dialog);
     if (g_file_dialog.SelectFilePressed) {
         g_file_dialog.SelectFilePressed = false;
         g_file_dialog_live = 0;
